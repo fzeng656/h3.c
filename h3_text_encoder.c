@@ -208,6 +208,16 @@ static int text_prefetch_depth(const h3_gpu *gpu) {
     return (int)depth;
 }
 
+static int text_command_window(void) {
+    const char *value = getenv("H3_QWEN_COMMAND_WINDOW");
+    if (!value || !*value) return 1;
+    char *tail = NULL;
+    long window = strtol(value, &tail, 10);
+    if (!tail || *tail || window < 1) window = 1;
+    if (window > 8) window = 8;
+    return (int)window;
+}
+
 static int layer_weights_load(load_context *load, int layer,
                               text_layer_weights *weights) {
     char prefix[96];
@@ -939,10 +949,15 @@ static int text_encode_bf16_impl(
         prefetch_slots_retire(slots, prefetch_depth);
         goto cleanup;
     }
+    int command_window = text_command_window();
+    load_context held_loads[8];
+    memset(held_loads, 0, sizeof(held_loads));
+    int held_count = 0;
     for (int layer = 0; layer < layer_count; layer++) {
+        int boundary = held_count + 1 >= command_window || layer + 1 >= layer_count;
         int layer_ok =
-            gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
-                          "layer stream begin", layer) &&
+            (held_count || gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
+                                         "layer stream begin", layer)) &&
             encode_layer(gpu, &weights, tokens, int8_mask, int8_group_size,
                          activation_only, quantized_input, input_scales, hidden, norm, query, key,
                          value, attention_heads, attention_output, gate, up,
@@ -953,13 +968,29 @@ static int text_encode_bf16_impl(
                  gpu, hidden, hidden, deepstack[layer],
                  tokens * TEXT_HIDDEN), error, error_size,
                  "deepstack residual", layer)) &&
-            gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
-                          "layer stream submit", layer);
+            gpu_operation(gpu, boundary ? h3_gpu_submit(gpu) : h3_gpu_continue(gpu),
+                          error, error_size,
+                          boundary ? "layer stream submit" : "layer stream continue",
+                          layer);
 
-        retire_deferred(&load);
         if (!layer_ok) {
+            /* If prior layers were committed without waiting, finish the chain
+             * before releasing their shared weight buffers. */
+            if (held_count) (void)h3_gpu_submit(gpu);
+            retire_deferred(&load);
+            for (int index = 0; index < held_count; index++)
+                retire_deferred(&held_loads[index]);
             prefetch_slots_retire(slots, prefetch_depth);
             goto cleanup;
+        }
+        if (boundary) {
+            retire_deferred(&load);
+            for (int index = 0; index < held_count; index++)
+                retire_deferred(&held_loads[index]);
+            held_count = 0;
+        } else {
+            held_loads[held_count++] = load;
+            load.deferred_count = 0;
         }
         if (progress) progress(layer + 1, TEXT_LAYERS, progress_opaque);
         if (layer + 1 >= layer_count) continue;
