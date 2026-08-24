@@ -453,6 +453,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:
                 @"h3_quantize_bf16_int8_head_major_to_rows_cached"];
             [names addObject:@"h3_quantize_bf16_int8_groups"];
+            [names addObject:@"h3_dequantize_int8_grouped_bf16"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar"];
             [names addObject:@"h3_quantize_bf16_int8_groups_scalar128"];
             [names addObject:
@@ -480,6 +481,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:@"h3_linear_int8_local_scales_nax_r128_k7168"];
             [names addObject:@"h3_gate_adaln_quantize_int8"];
             [names addObject:@"h3_gate_adaln_quantize_int8_scalar"];
+            [names addObject:@"h3_linear_int8_grouped_weight_nax_r128x64"];
             [names addObject:@"h3_linear_int8_grouped_nax_r128x64"];
             [names addObject:
                 @"h3_linear_int8_grouped_local_nax_r128x64"];
@@ -1088,6 +1090,9 @@ typedef struct {
 } int8_head_major_quant_args;
 typedef struct { uint32_t rows, columns, group_size, groups; }
     int8_group_quant_args;
+typedef struct {
+    uint32_t rows, input_dim, output_dim, group_size, groups;
+} int8_group_linear_args;
 typedef struct { uint32_t rows, width; float epsilon; } norm_args;
 typedef struct {
     uint32_t rows, width, slots, shift_slot, scale_slot;
@@ -3101,6 +3106,15 @@ int h3_gpu_quantize_weight_int8(h3_gpu *opaque, h3_gpu_tensor *output,
         1.0f, @"BF16 weight to quantize");
 }
 
+int h3_gpu_quantize_weight_int8_grouped(h3_gpu *opaque,
+                                h3_gpu_tensor *output,
+                                h3_gpu_tensor *scales,
+                                const h3_gpu_tensor *input, uint32_t rows,
+                                uint32_t columns, uint32_t group_size) {
+    return h3_gpu_quantize_bf16_int8_groups(
+        opaque, output, scales, input, rows, rows, columns, group_size, 0);
+}
+
 static int h3_gpu_linear_int8_bf16_layout(
                             h3_gpu *opaque, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
@@ -3161,6 +3175,111 @@ static int h3_gpu_linear_int8_bf16_layout(
                             (output_dim / 128u);
         [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_dequantize_int8_grouped_bf16(h3_gpu *opaque,
+                                h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *scales,
+                                uint32_t rows, uint32_t columns,
+                                uint32_t group_size) {
+    H3GPU *gpu = GPU(opaque);
+    if (!group_size || columns % group_size) return 0;
+    uint32_t groups = columns / group_size;
+    if (!h3_gpu_require_i8(gpu, input, (size_t)rows * columns,
+                            @"grouped int8 dequant input") ||
+        !h3_gpu_require_f32(gpu, scales, (size_t)rows * groups,
+                            @"grouped int8 dequant scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * columns,
+                             @"grouped int8 dequant output")) return 0;
+    int8_group_quant_args args = {rows, columns, group_size, groups};
+    return h3_gpu_dispatch_2d(gpu, @"h3_dequantize_int8_grouped_bf16",
+        columns, rows, ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
+}
+
+int h3_gpu_roundtrip_int8_grouped_bf16(h3_gpu *opaque,
+                                h3_gpu_tensor *input,
+                                h3_gpu_tensor *quantized,
+                                h3_gpu_tensor *scales,
+                                uint32_t rows, uint32_t columns,
+                                uint32_t group_size) {
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (!h3_gpu_quantize_bf16_int8_groups(
+            opaque, quantized, scales, input, rows, padded_rows, columns,
+            group_size, 0)) return 0;
+    return h3_gpu_dequantize_int8_grouped_bf16(
+        opaque, input, quantized, scales, rows, columns, group_size);
+}
+
+int h3_gpu_linear_int8_grouped_bf16(h3_gpu *opaque,
+                            h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim, uint32_t group_size) {
+    H3GPU *gpu = GPU(opaque);
+    uint32_t padded_rows = (rows + 127u) & ~127u;
+    if (!group_size || group_size % 128 || input_dim % group_size ||
+        output_dim % 64) return 0;
+    uint32_t groups = input_dim / group_size;
+    if (!gpu.tensorOpsEnabled || !rows ||
+        !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
+                           @"grouped int8 linear weight") ||
+        !h3_gpu_require_f32(gpu, weight_scales,
+                            (size_t)output_dim * groups,
+                            @"grouped int8 weight scales") ||
+        !h3_gpu_require_i8(gpu, quantized_input,
+                           (size_t)padded_rows * input_dim,
+                           @"grouped int8 linear input") ||
+        !h3_gpu_require_f32(gpu, input_scales,
+                            (size_t)padded_rows * groups,
+                            @"grouped int8 input scales") ||
+        !h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"grouped int8 BF16 input") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"grouped int8 output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    if (!h3_gpu_quantize_bf16_int8_groups(
+            opaque, quantized_input, input_scales, input, rows, padded_rows,
+            input_dim, group_size, 0)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_int8_grouped_weight_nax_r128x64");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu,
+            @"device cannot dispatch grouped-weight M5 int8 linear");
+        return 0;
+    }
+    int8_group_linear_args args = {
+        rows, input_dim, output_dim, group_size, groups
+    };
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(quantized_input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(input_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        NSUInteger dispatch = (NSUInteger)(padded_rows / 128u) *
+                              (output_dim / 64u);
+        [encoder dispatchThreadgroups:MTLSizeMake(dispatch, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;

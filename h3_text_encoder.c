@@ -50,6 +50,13 @@ typedef struct {
     h3_gpu_tensor *gate;
     h3_gpu_tensor *up;
     h3_gpu_tensor *down;
+    h3_gpu_tensor *query_i8, *query_scale;
+    h3_gpu_tensor *key_i8, *key_scale;
+    h3_gpu_tensor *value_i8, *value_scale;
+    h3_gpu_tensor *attention_output_i8, *attention_output_scale;
+    h3_gpu_tensor *gate_i8, *gate_scale;
+    h3_gpu_tensor *up_i8, *up_scale;
+    h3_gpu_tensor *down_i8, *down_scale;
 } text_layer_weights;
 
 typedef struct {
@@ -465,8 +472,108 @@ static int gpu_operation(h3_gpu *gpu, int ok, char *error, size_t error_size,
     return 0;
 }
 
+static h3_gpu_tensor *defer_new_i8(load_context *load, size_t elements) {
+    return defer(load, h3_gpu_tensor_new_i8(load->gpu, elements));
+}
+
+static h3_gpu_tensor *defer_new_f32(load_context *load, size_t elements) {
+    return defer(load, h3_gpu_tensor_new_f32(load->gpu, elements));
+}
+
+static int prepare_int8_weight(load_context *load,
+                               const h3_gpu_tensor *source,
+                               uint32_t rows, uint32_t columns,
+                               uint32_t group_size,
+                               h3_gpu_tensor **quantized,
+                               h3_gpu_tensor **scales) {
+    uint32_t groups = group_size ? columns / group_size : 1u;
+    *quantized = defer_new_i8(load, (size_t)rows * columns);
+    *scales = defer_new_f32(load, (size_t)rows * groups);
+    if (!*quantized || !*scales) return 0;
+    int ok = group_size ?
+        h3_gpu_quantize_weight_int8_grouped(
+            load->gpu, *quantized, *scales, source, rows, columns, group_size) :
+        h3_gpu_quantize_weight_int8(load->gpu, *quantized, *scales,
+                                    source, rows, columns);
+    const char *weight_only = getenv("H3_QWEN_INT8_WEIGHT_ONLY");
+    if (ok && group_size && weight_only && *weight_only &&
+        strcmp(weight_only, "0"))
+        ok = h3_gpu_dequantize_int8_grouped_bf16(
+            load->gpu, (h3_gpu_tensor *)source, *quantized, *scales,
+            rows, columns, group_size);
+    return ok;
+}
+
+static int layer_weights_quantize_int8(load_context *load,
+                                       text_layer_weights *weight,
+                                       uint32_t group_size) {
+    if (!h3_gpu_begin(load->gpu)) return 0;
+    int ok = prepare_int8_weight(load, weight->query,
+                                 TEXT_QUERY_DIM, TEXT_HIDDEN,
+                                 group_size, &weight->query_i8, &weight->query_scale) &&
+        prepare_int8_weight(load, weight->key,
+                            TEXT_KV_DIM, TEXT_HIDDEN,
+                            group_size, &weight->key_i8, &weight->key_scale) &&
+        prepare_int8_weight(load, weight->value,
+                            TEXT_KV_DIM, TEXT_HIDDEN,
+                            group_size, &weight->value_i8, &weight->value_scale) &&
+        prepare_int8_weight(load, weight->attention_output,
+                            TEXT_HIDDEN, TEXT_QUERY_DIM,
+                            group_size, &weight->attention_output_i8,
+                            &weight->attention_output_scale) &&
+        prepare_int8_weight(load, weight->gate,
+                            TEXT_INTERMEDIATE, TEXT_HIDDEN,
+                            group_size, &weight->gate_i8, &weight->gate_scale) &&
+        prepare_int8_weight(load, weight->up,
+                            TEXT_INTERMEDIATE, TEXT_HIDDEN,
+                            group_size, &weight->up_i8, &weight->up_scale) &&
+        prepare_int8_weight(load, weight->down,
+                            TEXT_HIDDEN, TEXT_INTERMEDIATE,
+                            group_size, &weight->down_i8, &weight->down_scale) &&
+        h3_gpu_submit(load->gpu);
+    return ok;
+}
+
+enum {
+    QWEN_I8_QKV = 1u << 0,
+    QWEN_I8_ATTN_OUT = 1u << 1,
+    QWEN_I8_GATE_UP = 1u << 2,
+    QWEN_I8_DOWN = 1u << 3,
+    QWEN_I8_ALL = QWEN_I8_QKV | QWEN_I8_ATTN_OUT |
+                  QWEN_I8_GATE_UP | QWEN_I8_DOWN
+};
+
+static unsigned qwen_int8_mask(void) {
+    const char *enabled = getenv("H3_QWEN_INT8_RUNTIME");
+    if (!enabled || !*enabled || !strcmp(enabled, "0")) return 0;
+    const char *stage = getenv("H3_QWEN_INT8_STAGE");
+    if (!stage || !*stage || !strcmp(stage, "all")) return QWEN_I8_ALL;
+    if (!strcmp(stage, "qkv")) return QWEN_I8_QKV;
+    if (!strcmp(stage, "out")) return QWEN_I8_ATTN_OUT;
+    if (!strcmp(stage, "gateup")) return QWEN_I8_GATE_UP;
+    if (!strcmp(stage, "down")) return QWEN_I8_DOWN;
+    if (!strcmp(stage, "attention")) return QWEN_I8_QKV | QWEN_I8_ATTN_OUT;
+    if (!strcmp(stage, "mlp")) return QWEN_I8_GATE_UP | QWEN_I8_DOWN;
+    return QWEN_I8_ALL;
+}
+
+static uint32_t qwen_int8_group_size(void) {
+    const char *value = getenv("H3_QWEN_INT8_GROUP");
+    if (!value || !*value || !strcmp(value, "0")) return 0;
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (!end || *end || (parsed != 32 && parsed != 64 &&
+                         parsed != 128 && parsed != 256 &&
+                         parsed != 512 && parsed != 1024)) return 0;
+    return (uint32_t)parsed;
+}
+
 static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
-                        uint32_t tokens, h3_gpu_tensor *hidden,
+                        uint32_t tokens, unsigned int8_mask,
+                        uint32_t int8_group_size, int activation_only,
+                        h3_gpu_tensor *quantized_input,
+                        h3_gpu_tensor *input_scales,
+                        h3_gpu_tensor *hidden,
                         h3_gpu_tensor *norm, h3_gpu_tensor *query,
                         h3_gpu_tensor *key, h3_gpu_tensor *value,
                         h3_gpu_tensor *attention_heads,
@@ -478,14 +585,35 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
 #define OP(call, label) do {                                                    \
     if (!gpu_operation(gpu, (call), error, error_size, label, layer)) return 0; \
 } while (0)
+#define I8_LINEAR(out, input, wi8, wscale, in_dim, out_dim)                    \
+    (int8_group_size ? h3_gpu_linear_int8_grouped_bf16(                        \
+        gpu, (out), quantized_input, input_scales, (input), (wi8), (wscale),    \
+        tokens, (in_dim), (out_dim), int8_group_size) :                        \
+     h3_gpu_linear_int8_bf16(                                                   \
+        gpu, (out), quantized_input, input_scales, (input), (wi8), (wscale),    \
+        tokens, (in_dim), (out_dim), 0))
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weight->input_norm,
                              tokens, TEXT_HIDDEN, TEXT_RMS_EPSILON),
        "input RMSNorm");
-    OP(h3_gpu_linear_bf16(gpu, query, norm, weight->query, NULL, tokens,
+    if (activation_only)
+        OP(h3_gpu_roundtrip_int8_grouped_bf16(
+               gpu, norm, quantized_input, input_scales, tokens,
+               TEXT_HIDDEN, int8_group_size),
+           "input activation int8 roundtrip");
+    OP((int8_mask & QWEN_I8_QKV) ?
+        I8_LINEAR(query, norm, weight->query_i8, weight->query_scale,
+                   TEXT_HIDDEN, TEXT_QUERY_DIM) :
+        h3_gpu_linear_bf16(gpu, query, norm, weight->query, NULL, tokens,
                            TEXT_HIDDEN, TEXT_QUERY_DIM), "query projection");
-    OP(h3_gpu_linear_bf16(gpu, key, norm, weight->key, NULL, tokens,
+    OP((int8_mask & QWEN_I8_QKV) ?
+        I8_LINEAR(key, norm, weight->key_i8, weight->key_scale,
+                   TEXT_HIDDEN, TEXT_KV_DIM) :
+        h3_gpu_linear_bf16(gpu, key, norm, weight->key, NULL, tokens,
                            TEXT_HIDDEN, TEXT_KV_DIM), "key projection");
-    OP(h3_gpu_linear_bf16(gpu, value, norm, weight->value, NULL, tokens,
+    OP((int8_mask & QWEN_I8_QKV) ?
+        I8_LINEAR(value, norm, weight->value_i8, weight->value_scale,
+                   TEXT_HIDDEN, TEXT_KV_DIM) :
+        h3_gpu_linear_bf16(gpu, value, norm, weight->value, NULL, tokens,
                            TEXT_HIDDEN, TEXT_KV_DIM), "value projection");
     OP(h3_gpu_head_rms_norm_bf16(gpu, query, weight->query_norm, tokens,
                                   TEXT_QUERY_HEADS, TEXT_HEAD_DIM,
@@ -500,7 +628,16 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
                                TEXT_QUERY_HEADS, TEXT_KV_HEADS, TEXT_HEAD_DIM,
                                1.0f / sqrtf((float)TEXT_HEAD_DIM)),
        "causal GQA");
-    OP(h3_gpu_linear_bf16(gpu, attention_output, attention_heads,
+    if (activation_only)
+        OP(h3_gpu_roundtrip_int8_grouped_bf16(
+               gpu, attention_heads, quantized_input, input_scales, tokens,
+               TEXT_QUERY_DIM, int8_group_size),
+           "attention activation int8 roundtrip");
+    OP((int8_mask & QWEN_I8_ATTN_OUT) ?
+        I8_LINEAR(attention_output, attention_heads,
+                   weight->attention_output_i8,
+                   weight->attention_output_scale, TEXT_QUERY_DIM, TEXT_HIDDEN) :
+        h3_gpu_linear_bf16(gpu, attention_output, attention_heads,
                            weight->attention_output, NULL, tokens,
                            TEXT_QUERY_DIM, TEXT_HIDDEN),
        "attention output projection");
@@ -509,16 +646,36 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, weight->post_norm, tokens,
                              TEXT_HIDDEN, TEXT_RMS_EPSILON),
        "post-attention RMSNorm");
-    OP(h3_gpu_linear_bf16(gpu, gate, norm, weight->gate, NULL, tokens,
+    if (activation_only)
+        OP(h3_gpu_roundtrip_int8_grouped_bf16(
+               gpu, norm, quantized_input, input_scales, tokens,
+               TEXT_HIDDEN, int8_group_size),
+           "MLP input activation int8 roundtrip");
+    OP((int8_mask & QWEN_I8_GATE_UP) ?
+        I8_LINEAR(gate, norm, weight->gate_i8, weight->gate_scale,
+                   TEXT_HIDDEN, TEXT_INTERMEDIATE) :
+        h3_gpu_linear_bf16(gpu, gate, norm, weight->gate, NULL, tokens,
                            TEXT_HIDDEN, TEXT_INTERMEDIATE), "MLP gate");
-    OP(h3_gpu_linear_bf16(gpu, up, norm, weight->up, NULL, tokens,
+    OP((int8_mask & QWEN_I8_GATE_UP) ?
+        I8_LINEAR(up, norm, weight->up_i8, weight->up_scale,
+                   TEXT_HIDDEN, TEXT_INTERMEDIATE) :
+        h3_gpu_linear_bf16(gpu, up, norm, weight->up, NULL, tokens,
                            TEXT_HIDDEN, TEXT_INTERMEDIATE), "MLP up");
     OP(h3_gpu_silu_mul_bf16(gpu, gate, gate, up,
                              tokens * TEXT_INTERMEDIATE), "fused SwiGLU");
-    OP(h3_gpu_linear_bf16(gpu, mlp_output, gate, weight->down, NULL, tokens,
+    if (activation_only)
+        OP(h3_gpu_roundtrip_int8_grouped_bf16(
+               gpu, gate, quantized_input, input_scales, tokens,
+               TEXT_INTERMEDIATE, int8_group_size),
+           "MLP output activation int8 roundtrip");
+    OP((int8_mask & QWEN_I8_DOWN) ?
+        I8_LINEAR(mlp_output, gate, weight->down_i8, weight->down_scale,
+                   TEXT_INTERMEDIATE, TEXT_HIDDEN) :
+        h3_gpu_linear_bf16(gpu, mlp_output, gate, weight->down, NULL, tokens,
                            TEXT_INTERMEDIATE, TEXT_HIDDEN), "MLP down");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, mlp_output,
                         tokens * TEXT_HIDDEN), "MLP residual");
+#undef I8_LINEAR
 #undef OP
     return 1;
 }
@@ -588,6 +745,28 @@ static int text_encode_bf16_impl(
     size_t query_count = token_count * TEXT_QUERY_DIM;
     size_t kv_count = token_count * TEXT_KV_DIM;
     size_t intermediate_count = token_count * TEXT_INTERMEDIATE;
+    unsigned requested_int8_mask = qwen_int8_mask();
+    const char *weight_only_value = getenv("H3_QWEN_INT8_WEIGHT_ONLY");
+    const char *activation_only_value = getenv("H3_QWEN_INT8_ACT_ONLY");
+    int weight_only = weight_only_value && *weight_only_value &&
+                      strcmp(weight_only_value, "0");
+    int activation_only = activation_only_value && *activation_only_value &&
+                          strcmp(activation_only_value, "0");
+    unsigned int8_mask = (weight_only || activation_only) ? 0u :
+                         requested_int8_mask;
+    int quantize_weights = weight_only || (!activation_only && int8_mask != 0);
+    int use_int8_runtime = quantize_weights || activation_only;
+    uint32_t int8_group_size = use_int8_runtime ? qwen_int8_group_size() : 0;
+    uint32_t padded_tokens = (tokens + 127u) & ~127u;
+    uint32_t int8_scale_groups = int8_group_size ?
+        TEXT_INTERMEDIATE / int8_group_size : 1u;
+    if ((weight_only || activation_only) && !int8_group_size) {
+        fail(error, error_size,
+             "Qwen grouped int8 diagnostic requires H3_QWEN_INT8_GROUP");
+        h3_gpu_free(gpu);
+        h3_weight_store_free(store);
+        return 0;
+    }
 
     float *cosines = malloc(token_count * TEXT_ROPE_HALF * sizeof(*cosines));
     float *sines = malloc(token_count * TEXT_ROPE_HALF * sizeof(*sines));
@@ -643,6 +822,11 @@ static int text_encode_bf16_impl(
     h3_gpu_tensor *gate = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
     h3_gpu_tensor *up = h3_gpu_tensor_new_bf16(gpu, intermediate_count);
     h3_gpu_tensor *mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_count);
+    h3_gpu_tensor *quantized_input = use_int8_runtime ?
+        h3_gpu_tensor_new_i8(gpu, (size_t)padded_tokens * TEXT_INTERMEDIATE) : NULL;
+    h3_gpu_tensor *input_scales = use_int8_runtime ?
+        h3_gpu_tensor_new_f32(gpu,
+            (size_t)padded_tokens * int8_scale_groups) : NULL;
     h3_gpu_tensor *deepstack[3] = {NULL, NULL, NULL};
     if (span_count) {
         uint16_t *values = calloc(hidden_count, sizeof(*values));
@@ -666,13 +850,15 @@ static int text_encode_bf16_impl(
     h3_gpu_tensor *activations[] = {
         ids, rope_cos, rope_sin, hidden, norm, query, key, value,
         attention_heads, attention_output, gate, up, mlp_output,
-        deepstack[0], deepstack[1], deepstack[2]
+        deepstack[0], deepstack[1], deepstack[2],
+        quantized_input, input_scales
     };
     int ok = 1;
     for (size_t index = 0; index < sizeof(activations) / sizeof(*activations);
          index++) {
         if (!activations[index] && (index < 13 || span_count)) ok = 0;
     }
+    if (use_int8_runtime && (!quantized_input || !input_scales)) ok = 0;
     if (!ok) {
         fail(error, error_size, "cannot allocate Qwen activations: %s",
              h3_gpu_error(gpu));
@@ -747,11 +933,18 @@ static int text_encode_bf16_impl(
             goto cleanup;
         }
     }
+    if (quantize_weights && !layer_weights_quantize_int8(&load, &weights, int8_group_size)) {
+        fail(error, error_size, "cannot quantize Qwen layer 0 to int8: %s",
+             h3_gpu_error(gpu));
+        prefetch_slots_retire(slots, prefetch_depth);
+        goto cleanup;
+    }
     for (int layer = 0; layer < layer_count; layer++) {
         int layer_ok =
             gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
                           "layer stream begin", layer) &&
-            encode_layer(gpu, &weights, tokens, hidden, norm, query, key,
+            encode_layer(gpu, &weights, tokens, int8_mask, int8_group_size,
+                         activation_only, quantized_input, input_scales, hidden, norm, query, key,
                          value, attention_heads, attention_output, gate, up,
                          mlp_output, rope_cos, rope_sin, layer,
                          error, error_size) &&
@@ -802,6 +995,13 @@ static int text_encode_bf16_impl(
         } else if (!layer_weights_load(&load, layer + 1, &weights)) {
             goto cleanup;
         }
+        if (quantize_weights &&
+            !layer_weights_quantize_int8(&load, &weights, int8_group_size)) {
+            fail(error, error_size, "cannot quantize Qwen layer %d to int8: %s",
+                 layer + 1, h3_gpu_error(gpu));
+            prefetch_slots_retire(slots, prefetch_depth);
+            goto cleanup;
+        }
     }
 
     output->values = malloc(hidden_count * sizeof(*output->values));
@@ -814,6 +1014,15 @@ static int text_encode_bf16_impl(
         h3_text_embedding_free(output);
         fail(error, error_size, "cannot read completed Qwen output");
         goto cleanup;
+    }
+    const char *qwen_dump = getenv("H3_QWEN_DUMP");
+    if (qwen_dump && *qwen_dump) {
+        FILE *dump = fopen(qwen_dump, "wb");
+        if (dump) {
+            (void)fwrite(output->values, sizeof(*output->values),
+                         hidden_count, dump);
+            fclose(dump);
+        }
     }
     output->tokens = token_count;
     output->width = TEXT_HIDDEN;

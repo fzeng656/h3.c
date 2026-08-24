@@ -70,6 +70,29 @@ struct int8_group_quant_args {
     uint groups;
 };
 
+struct int8_group_linear_args {
+    uint rows;
+    uint input_dim;
+    uint output_dim;
+    uint group_size;
+    uint groups;
+};
+
+kernel void h3_dequantize_int8_grouped_bf16(
+                           device const int8_t *input [[buffer(0)]],
+                           device const float *scales [[buffer(1)]],
+                           device bfloat *output [[buffer(2)]],
+                           constant int8_group_quant_args &args [[buffer(3)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.columns) return;
+    uint group = column / args.group_size;
+    uint index = row * args.columns + column;
+    output[index] = (bfloat)((float)input[index] *
+                             scales[row * args.groups + group]);
+}
+
 kernel void h3_linear_f32(device const float *input [[buffer(0)]],
                           device const float *weight [[buffer(1)]],
                           device const float *bias [[buffer(2)]],
@@ -2674,6 +2697,78 @@ kernel h3_linear_int8_local_scales_nax_r128_t
  * each group's exact int32 product separately, then apply its scale before
  * adding it to the FP32 tile.  The 128x64 tile keeps that FP32 tile within
  * the M5 threadgroup-memory limit. */
+/* Generic grouped-weight INT8 linear used by the Qwen quality oracle.
+ * Both activations and weight rows carry one scale per K group. Keep K tiles
+ * at 128 so group sizes 128/256/512/1024 share exactly the same arithmetic. */
+kernel void h3_linear_int8_grouped_weight_nax_r128x64(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant int8_group_linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint ROW_TILE = 128;
+    constexpr uint COLUMN_TILE = 64;
+    constexpr uint K_TILE = 128;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_tiles = padded_rows / ROW_TILE;
+    uint column_tiles = args.output_dim / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> mm;
+    threadgroup float totals[ROW_TILE * COLUMN_TILE];
+    uint k_tiles_per_group = args.group_size / K_TILE;
+    for (uint scale_group = 0; scale_group < args.groups; scale_group++) {
+        uint k_start = scale_group * args.group_size;
+        auto first_a = x.slice<ROW_TILE, K_TILE>((int)k_start, (int)row_start);
+        auto first_b = w.slice<K_TILE, COLUMN_TILE>((int)k_start,
+                                                    (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        for (uint k_tile = 0; k_tile < k_tiles_per_group; k_tile++) {
+            uint k = k_start + k_tile * K_TILE;
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>((int)k,
+                                                  (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint local = (uint)index[1] * COLUMN_TILE + (uint)index[0];
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)accum[element] *
+                input_scales[row * args.groups + scale_group] *
+                weight_scales[column * args.groups + scale_group];
+            if (scale_group == 0) totals[local] = value;
+            else totals[local] += value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint local = tid; local < ROW_TILE * COLUMN_TILE; local += 128) {
+        uint row = row_start + local / COLUMN_TILE;
+        uint column = column_start + local % COLUMN_TILE;
+        if (row < args.rows)
+            output[row * args.output_dim + column] = (bfloat)totals[local];
+    }
+}
+
 kernel void h3_linear_int8_grouped_nax_r128x64(
                            device int8_t *input [[buffer(0)]],
                            device int8_t *weight [[buffer(1)]],
