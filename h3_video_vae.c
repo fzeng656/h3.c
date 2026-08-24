@@ -87,6 +87,7 @@ typedef struct {
     int latent_w;
     int latent_t;
     int output_frames;
+    int bf16;
 } vae_context;
 
 struct h3_video_vae_decoder {
@@ -119,11 +120,45 @@ static void free_tensor(h3_gpu_tensor **tensor) {
     *tensor = NULL;
 }
 
+static const char *vae_bf16_directory(void) {
+    const char *dir = getenv("H3_VAE_BF16_DIR");
+    return dir && *dir ? dir : NULL;
+}
+
+static uint16_t vae_f32_to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += UINT32_C(0x7fff) + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static float vae_bf16_to_f32(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static h3_gpu_tensor *tensor_from_f32_storage(vae_context *vae,
+                                               const float *values,
+                                               size_t elements) {
+    if (!vae->bf16) return h3_gpu_tensor_from_f32(vae->gpu, values, elements);
+    uint16_t *packed = malloc(elements * sizeof(*packed));
+    if (!packed) return NULL;
+    for (size_t i = 0; i < elements; i++) packed[i] = vae_f32_to_bf16(values[i]);
+    h3_gpu_tensor *result = h3_gpu_tensor_from_bf16(vae->gpu, packed, elements);
+    free(packed);
+    return result;
+}
+
 static h3_gpu_tensor *load_f32(vae_context *vae, const char *name, int ndim,
                                const uint64_t *shape, char *error,
                                size_t error_size) {
-    return h3_weight_load_f32(vae->weights, vae->gpu, name, ndim, shape,
-                              error, error_size);
+    return vae->bf16 ?
+        h3_weight_load_bf16(vae->weights, vae->gpu, name, ndim, shape,
+                            error, error_size) :
+        h3_weight_load_f32(vae->weights, vae->gpu, name, ndim, shape,
+                           error, error_size);
 }
 
 static h3_gpu_tensor *f1(vae_context *vae, const char *name, uint64_t width,
@@ -340,7 +375,7 @@ static int prepare_input(vae_context *vae, const float *input,
                                   mean[channel];
                 }
     }
-    vae->latent = h3_gpu_tensor_from_f32(vae->gpu, rows, patch_elements);
+    vae->latent = tensor_from_f32_storage(vae, rows, patch_elements);
     free(rows);
     return vae->latent != NULL;
 }
@@ -383,8 +418,8 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
         }
         row++;
     }
-    vae->rope_cos = h3_gpu_tensor_from_f32(vae->gpu, cosines, count);
-    vae->rope_sin = h3_gpu_tensor_from_f32(vae->gpu, sines, count);
+    vae->rope_cos = tensor_from_f32_storage(vae, cosines, count);
+    vae->rope_sin = tensor_from_f32_storage(vae, sines, count);
     free(cosines); free(sines);
     if (!vae->rope_cos || !vae->rope_sin) {
         fail(error, error_size, "cannot allocate video VAE RoPE: %s",
@@ -397,7 +432,9 @@ static int prepare_rope(vae_context *vae, char *error, size_t error_size) {
 static int allocate_activations(vae_context *vae, char *error,
                                 size_t error_size) {
     size_t patches = vae->patches, sequence = vae->sequence;
-#define F32(field, elements) (vae->field = h3_gpu_tensor_new_f32(vae->gpu, (elements)))
+#define F32(field, elements) (vae->field = vae->bf16 ? \
+    h3_gpu_tensor_new_bf16(vae->gpu, (elements)) : \
+    h3_gpu_tensor_new_f32(vae->gpu, (elements)))
     h3_gpu_tensor *all[] = {
         F32(post, patches * LATENT_CHANNELS),
         F32(patch_hidden, patches * HIDDEN),
@@ -420,8 +457,44 @@ static int allocate_activations(vae_context *vae, char *error,
     return 1;
 }
 
+static int run_block_bf16(vae_context *vae, int index, char *error,
+                           size_t error_size) {
+    vae_block *weight = &vae->blocks[index];
+    uint32_t rows = vae->sequence;
+#define OP(call, label) do {                                                    \
+    if (!gpu_op(vae, (call), error, error_size, label)) return 0;               \
+} while (0)
+    OP(h3_gpu_rms_norm_bf16(vae->gpu, vae->norm, vae->hidden, weight->norm1,
+        rows, HIDDEN, 1e-5f), "video VAE BF16 attention norm");
+    OP(h3_gpu_linear_bf16(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
+        weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE BF16 QKV");
+    OP(h3_gpu_video_qkv_rope_bf16(vae->gpu, vae->query, vae->key, vae->value,
+        vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS, HEAD_DIM,
+        ROPE_HALF, 1e-5f), "video VAE BF16 QK norm/RoPE");
+    OP(h3_gpu_sdpa_bf16(vae->gpu, vae->heads, vae->query, vae->key, vae->value,
+        rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+       "video VAE BF16 attention");
+    OP(h3_gpu_linear_bf16(vae->gpu, vae->branch, vae->heads, weight->out_w,
+        weight->out_b, rows, INNER, HIDDEN), "video VAE BF16 attention output");
+    OP(h3_gpu_scale_add_bf16(vae->gpu, vae->hidden, vae->hidden, vae->branch,
+        weight->scale1, rows, HIDDEN), "video VAE BF16 attention residual");
+    OP(h3_gpu_rms_norm_bf16(vae->gpu, vae->norm, vae->hidden, weight->norm2,
+        rows, HIDDEN, 1e-5f), "video VAE BF16 MLP norm");
+    OP(h3_gpu_linear_bf16(vae->gpu, vae->ff1, vae->norm, weight->w1,
+        weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE BF16 MLP input");
+    OP(h3_gpu_swiglu_bf16(vae->gpu, vae->activated, vae->ff1, rows, FFN),
+       "video VAE BF16 SwiGLU");
+    OP(h3_gpu_linear_bf16(vae->gpu, vae->branch, vae->activated, weight->w2,
+        weight->w2_b, rows, FFN, HIDDEN), "video VAE BF16 MLP output");
+    OP(h3_gpu_scale_add_bf16(vae->gpu, vae->hidden, vae->hidden, vae->branch,
+        weight->scale2, rows, HIDDEN), "video VAE BF16 MLP residual");
+#undef OP
+    return 1;
+}
+
 static int run_block(vae_context *vae, int index, char *error,
                      size_t error_size) {
+    if (vae->bf16) return run_block_bf16(vae, index, error, error_size);
     vae_block *weight = &vae->blocks[index];
     uint32_t rows = vae->sequence;
 #define OP(call, label) do {                                                    \
@@ -460,7 +533,7 @@ static int run_decoder(vae_context *vae, h3_video_vae_progress progress,
                        size_t error_size) {
     float zeros[HIDDEN];
     memset(zeros, 0, sizeof(zeros));
-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    h3_gpu_tensor *zero = tensor_from_f32_storage(vae, zeros, HIDDEN);
     if (!zero) {
         fail(error, error_size, "cannot allocate video VAE suffix token");
         return 0;
@@ -534,7 +607,7 @@ static int run_resident_tile(vae_context *vae, char *error,
                              size_t error_size) {
     float zeros[HIDDEN];
     memset(zeros, 0, sizeof(zeros));
-    h3_gpu_tensor *zero = h3_gpu_tensor_from_f32(vae->gpu, zeros, HIDDEN);
+    h3_gpu_tensor *zero = tensor_from_f32_storage(vae, zeros, HIDDEN);
     if (!zero) {
         fail(error, error_size, "cannot allocate video VAE suffix token");
         return 0;
@@ -545,18 +618,18 @@ static int run_resident_tile(vae_context *vae, char *error,
     }                                                                           \
 } while (0)
     OP(h3_gpu_begin(vae->gpu), "begin tiled video VAE decoder");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->post, vae->latent, vae->post_w,
+    OP((vae->bf16 ? h3_gpu_linear_bf16 : h3_gpu_linear_f32)(vae->gpu, vae->post, vae->latent, vae->post_w,
         vae->post_b, vae->patches, LATENT_CHANNELS, LATENT_CHANNELS),
        "tiled video VAE post-quant projection");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->patch_hidden, vae->post, vae->embed_w,
+    OP((vae->bf16 ? h3_gpu_linear_bf16 : h3_gpu_linear_f32)(vae->gpu, vae->patch_hidden, vae->post, vae->embed_w,
         vae->embed_b, vae->patches, LATENT_CHANNELS, HIDDEN),
        "tiled video VAE latent embedding");
-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden, 0, vae->patch_hidden, 0,
+    OP((vae->bf16 ? h3_gpu_copy_bf16 : h3_gpu_copy_f32)(vae->gpu, vae->hidden, 0, vae->patch_hidden, 0,
         (size_t)vae->patches * HIDDEN), "pack tiled video VAE patches");
-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
+    OP((vae->bf16 ? h3_gpu_copy_bf16 : h3_gpu_copy_f32)(vae->gpu, vae->hidden,
         (size_t)vae->patches * HIDDEN, vae->registers, 0,
         REGISTERS * HIDDEN), "pack tiled video VAE registers");
-    OP(h3_gpu_copy_f32(vae->gpu, vae->hidden,
+    OP((vae->bf16 ? h3_gpu_copy_bf16 : h3_gpu_copy_f32)(vae->gpu, vae->hidden,
         (size_t)(vae->patches + REGISTERS) * HIDDEN, zero, 0, HIDDEN),
        "pack tiled video VAE suffix");
     for (int index = 0; index < LAYERS; index++)
@@ -564,10 +637,10 @@ static int run_resident_tile(vae_context *vae, char *error,
             h3_gpu_tensor_free(zero);
             return 0;
         }
-    OP(h3_gpu_layer_norm_f32(vae->gpu, vae->norm, vae->hidden,
+    OP((vae->bf16 ? h3_gpu_layer_norm_bf16 : h3_gpu_layer_norm_f32)(vae->gpu, vae->norm, vae->hidden,
         vae->norm_out_w, vae->norm_out_b, vae->sequence, HIDDEN, 1e-5f),
        "tiled video VAE output LayerNorm");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->projected, vae->norm, vae->proj_w,
+    OP((vae->bf16 ? h3_gpu_linear_bf16 : h3_gpu_linear_f32)(vae->gpu, vae->projected, vae->norm, vae->proj_w,
         vae->proj_b, vae->sequence, HIDDEN, OUTPUT_PATCH),
        "tiled video VAE output projection");
     OP(h3_gpu_submit(vae->gpu), "submit tiled video VAE decoder");
@@ -585,19 +658,24 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
         return 0;
     }
     size_t projected_count = (size_t)vae->sequence * OUTPUT_PATCH;
-    float *rows = malloc(projected_count * sizeof(*rows));
+    float *rows = vae->bf16 ? NULL : malloc(projected_count * sizeof(*rows));
+    uint16_t *rows_bf16 = vae->bf16 ?
+        malloc(projected_count * sizeof(*rows_bf16)) : NULL;
     int pixel_h = vae->latent_h * 16;
     int pixel_w = vae->latent_w * 16;
     size_t rgb_count = (size_t)frame_count * (size_t)pixel_h *
                        (size_t)pixel_w * 3;
     float *rgb = malloc(rgb_count * sizeof(*rgb));
-    if (!rows || !rgb) {
-        free(rows); free(rgb);
+    if ((!vae->bf16 && !rows) || (vae->bf16 && !rows_bf16) || !rgb) {
+        free(rows); free(rows_bf16); free(rgb);
         fail(error, error_size, "out of memory unpacking video VAE frames");
         return 0;
     }
-    if (!h3_gpu_tensor_read_f32(vae->projected, rows, projected_count)) {
-        free(rows); free(rgb);
+    int read_ok = vae->bf16 ?
+        h3_gpu_tensor_read_bf16(vae->projected, rows_bf16, projected_count) :
+        h3_gpu_tensor_read_f32(vae->projected, rows, projected_count);
+    if (!read_ok) {
+        free(rows); free(rows_bf16); free(rgb);
         fail(error, error_size, "cannot read video VAE output patches");
         return 0;
     }
@@ -621,8 +699,10 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
                     size_t component = ((((size_t)channel * 4 +
                         (size_t)within_t) * 16 + (size_t)within_y) * 16 +
                         (size_t)within_x);
-                    float value = rows[patch * OUTPUT_PATCH + component] *
-                                  deviation[channel] + mean[channel];
+                    size_t source_index = patch * OUTPUT_PATCH + component;
+                    float source_value = vae->bf16 ?
+                        vae_bf16_to_f32(rows_bf16[source_index]) : rows[source_index];
+                    float value = source_value * deviation[channel] + mean[channel];
                     if (value < 0.0f) value = 0.0f;
                     if (value > 1.0f) value = 1.0f;
                     size_t destination = (((size_t)output_frame *
@@ -635,6 +715,7 @@ static int unpack_frame_range(vae_context *vae, int first_frame,
         }
     }
     free(rows);
+    free(rows_bf16);
     output->frames = frame_count;
     output->height = pixel_h;
     output->width = pixel_w;
@@ -910,10 +991,12 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
     }
     decoder->latent_h = latent_height;
     decoder->latent_w = latent_width;
+    const char *bf16_dir = vae_bf16_directory();
+    const char *selected_weights = bf16_dir ? bf16_dir : weight_directory;
     int tile_pixels = configured_tile_pixels(
         latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
     int ok = load_latent_normalization(
-        weight_directory, decoder->latent_mean, decoder->latent_std,
+        selected_weights, decoder->latent_mean, decoder->latent_std,
         error, error_size) &&
         tile_axis_build(latent_height * SPATIAL_RATIO, tile_pixels,
                         &decoder->y_axis, error, error_size) &&
@@ -923,6 +1006,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
         fprintf(stderr, "h3: resident video VAE tiles %dx%d at %d pixels\n",
                 decoder->x_axis.count, decoder->y_axis.count, tile_pixels);
     vae_context *vae = &decoder->vae;
+    vae->bf16 = bf16_dir != NULL;
     if (ok) {
         vae->latent_h = decoder->y_axis.length / SPATIAL_RATIO;
         vae->latent_w = decoder->x_axis.length / SPATIAL_RATIO;
@@ -931,7 +1015,7 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
         vae->patches = (uint32_t)(CHUNK_LATENT_TIME * vae->latent_h *
                                   vae->latent_w);
         vae->sequence = vae->patches + SUFFIX;
-        vae->weights = h3_weight_store_open(weight_directory,
+        vae->weights = h3_weight_store_open(selected_weights,
                                              error, error_size);
         if (vae->weights)
             vae->gpu = h3_gpu_create(shader_source_path, error, error_size);
@@ -1071,6 +1155,7 @@ static int decode_chunked(const char *weight_directory,
                 x_axis.count, y_axis.count, tile_pixels);
     vae_context vae;
     memset(&vae, 0, sizeof(vae));
+    vae.bf16 = vae_bf16_directory() != NULL;
     vae.latent_h = y_axis.length / SPATIAL_RATIO;
     vae.latent_w = x_axis.length / SPATIAL_RATIO;
     vae.latent_t = CHUNK_LATENT_TIME;
@@ -1190,6 +1275,8 @@ int h3_video_vae_decode(const char *weight_directory,
                         char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
     if (error && error_size) error[0] = '\0';
+    const char *bf16_dir = vae_bf16_directory();
+    const char *selected_weights = bf16_dir ? bf16_dir : weight_directory;
     if (!weight_directory || !shader_source_path || !normalized_latent ||
         !output || latent_time < 2 ||
         (latent_time != 2 && (latent_time < CHUNK_LATENT_TIME ||
@@ -1211,7 +1298,7 @@ int h3_video_vae_decode(const char *weight_directory,
     vae.patches = (uint32_t)(CHUNK_LATENT_TIME * latent_height * latent_width);
     vae.sequence = vae.patches + SUFFIX;
     float latent_mean[LATENT_CHANNELS], latent_std[LATENT_CHANNELS];
-    if (!load_latent_normalization(weight_directory, latent_mean, latent_std,
+    if (!load_latent_normalization(selected_weights, latent_mean, latent_std,
                                    error, error_size)) return 0;
     int tile_pixels = configured_tile_pixels(
         latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
@@ -1225,7 +1312,7 @@ int h3_video_vae_decode(const char *weight_directory,
     if (latent_time > CHUNK_LATENT_TIME ||
         latent_height > tile_pixels / SPATIAL_RATIO ||
         latent_width > tile_pixels / SPATIAL_RATIO) {
-        int ok = decode_chunked(weight_directory, shader_source_path,
+        int ok = decode_chunked(selected_weights, shader_source_path,
                                 normalized_latent, latent_time, latent_height,
                                 latent_width, latent_mean, latent_std,
                                 tile_pixels, progress,
