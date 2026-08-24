@@ -1,10 +1,14 @@
 #include "h3_dit_schedule.h"
 
 #include <math.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 enum {
     TIME_INPUT = 256,
@@ -234,6 +238,216 @@ cleanup:
     return result;
 }
 
+
+#define H3_ADALN_CACHE_ALIGN UINT64_C(4096)
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t steps;
+    uint32_t time_rows;
+    uint32_t visual_condition;
+    uint32_t audio_condition;
+    uint64_t key;
+    uint64_t total_bytes;
+} h3_adaln_cache_header;
+
+static uint64_t adaln_align(uint64_t value) {
+    return (value + H3_ADALN_CACHE_ALIGN - 1) & ~(H3_ADALN_CACHE_ALIGN - 1);
+}
+
+static uint64_t adaln_hash_bytes(uint64_t hash, const void *data, size_t size) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < size; i++) {
+        hash ^= p[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t adaln_schedule_key(const h3_sigma_schedule *sigmas,
+                                   int visual_condition,
+                                   int audio_condition) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = adaln_hash_bytes(hash, &sigmas->steps, sizeof(sigmas->steps));
+    hash = adaln_hash_bytes(hash, sigmas->video,
+        ((size_t)sigmas->steps + 1) * sizeof(sigmas->video[0]));
+    hash = adaln_hash_bytes(hash, sigmas->audio,
+        ((size_t)sigmas->steps + 1) * sizeof(sigmas->audio[0]));
+    hash = adaln_hash_bytes(hash, &visual_condition, sizeof(visual_condition));
+    hash = adaln_hash_bytes(hash, &audio_condition, sizeof(audio_condition));
+    return hash;
+}
+
+static uint64_t adaln_block_elements(const h3_dit_schedule *schedule) {
+    return (uint64_t)schedule->time_rows * BLOCK_OUTPUT;
+}
+
+static uint64_t adaln_final_elements(const h3_dit_schedule *schedule) {
+    return (uint64_t)schedule->time_rows * FINAL_OUTPUT;
+}
+
+static uint64_t adaln_block_offset(const h3_dit_schedule *schedule,
+                                   unsigned wanted) {
+    uint64_t offset = H3_ADALN_CACHE_ALIGN;
+    uint64_t bytes = adaln_block_elements(schedule) * sizeof(uint16_t);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        offset = adaln_align(offset);
+        if (block == wanted) return offset;
+        offset += bytes;
+    }
+    return 0;
+}
+
+static uint64_t adaln_final_offset(const h3_dit_schedule *schedule) {
+    uint64_t offset = H3_ADALN_CACHE_ALIGN;
+    uint64_t bytes = adaln_block_elements(schedule) * sizeof(uint16_t);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        offset = adaln_align(offset);
+        offset += bytes;
+    }
+    return adaln_align(offset);
+}
+
+static uint64_t adaln_total_bytes(const h3_dit_schedule *schedule) {
+    return adaln_align(adaln_final_offset(schedule) +
+        adaln_final_elements(schedule) * sizeof(uint16_t));
+}
+
+static int adaln_cache_path(char *path, size_t size,
+                            const h3_sigma_schedule *sigmas,
+                            int visual_condition, int audio_condition,
+                            uint64_t *key_out) {
+    const char *dir = getenv("H3_ADALN_CACHE_DIR");
+    if (!dir || !*dir) return 0;
+    uint64_t key = adaln_schedule_key(sigmas, visual_condition, audio_condition);
+    int n = snprintf(path, size, "%s/adaln-v1-%016llx.bin", dir,
+                     (unsigned long long)key);
+    if (n < 0 || (size_t)n >= size) return 0;
+    if (key_out) *key_out = key;
+    return 1;
+}
+
+static void adaln_cache_drop_tensors(h3_dit_schedule *schedule) {
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        h3_gpu_tensor_free(schedule->blocks[block]);
+        schedule->blocks[block] = NULL;
+    }
+    h3_gpu_tensor_free(schedule->final);
+    schedule->final = NULL;
+}
+
+static int adaln_cache_try_load(h3_dit_schedule *schedule,
+                                const h3_sigma_schedule *sigmas,
+                                int visual_condition, int audio_condition,
+                                h3_dit_schedule_progress progress,
+                                void *progress_opaque,
+                                char *error, size_t error_size) {
+    char path[1024];
+    uint64_t key = 0;
+    if (!adaln_cache_path(path, sizeof(path), sigmas, visual_condition,
+                          audio_condition, &key)) return 0;
+    FILE *stream = fopen(path, "rb");
+    if (!stream) return 0;
+    h3_adaln_cache_header header;
+    size_t got = fread(&header, 1, sizeof(header), stream);
+    fclose(stream);
+    static const char magic[8] = {'H','3','A','D','L','N','1','\0'};
+    struct stat st;
+    if (got != sizeof(header) || memcmp(header.magic, magic, sizeof(magic)) ||
+        header.version != 1 || header.steps != (uint32_t)sigmas->steps ||
+        header.time_rows != schedule->time_rows ||
+        header.visual_condition != (uint32_t)(visual_condition != 0) ||
+        header.audio_condition != (uint32_t)(audio_condition != 0) ||
+        header.key != key || stat(path, &st) != 0 || st.st_size < 0 ||
+        (uint64_t)st.st_size < header.total_bytes ||
+        header.total_bytes != adaln_total_bytes(schedule)) return 0;
+    size_t block_elements = (size_t)adaln_block_elements(schedule);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        schedule->blocks[block] = h3_gpu_tensor_load_bf16(
+            schedule->gpu, path, adaln_block_offset(schedule, block),
+            block_elements);
+        if (!schedule->blocks[block]) {
+            adaln_cache_drop_tensors(schedule);
+            if (error && error_size) error[0] = '\0';
+            return 0;
+        }
+        if (progress) progress((int)block + 1, (int)H3_DIT_BLOCKS,
+                               progress_opaque);
+    }
+    schedule->final = h3_gpu_tensor_load_bf16(
+        schedule->gpu, path, adaln_final_offset(schedule),
+        (size_t)adaln_final_elements(schedule));
+    if (!schedule->final) {
+        adaln_cache_drop_tensors(schedule);
+        if (error && error_size) error[0] = '\0';
+        return 0;
+    }
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: AdaLN cache hit %s (%.1f MiB)\n", path,
+                (double)header.total_bytes / (1024.0 * 1024.0));
+    return 1;
+}
+
+static int adaln_cache_write(h3_dit_schedule *schedule,
+                             const h3_sigma_schedule *sigmas,
+                             int visual_condition, int audio_condition,
+                             char *detail, size_t detail_size) {
+    char path[1024];
+    uint64_t key = 0;
+    if (!adaln_cache_path(path, sizeof(path), sigmas, visual_condition,
+                          audio_condition, &key)) return 1;
+    const char *dir = getenv("H3_ADALN_CACHE_DIR");
+    if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+        snprintf(detail, detail_size, "cannot create AdaLN cache dir: %s",
+                 strerror(errno));
+        return 0;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        snprintf(detail, detail_size, "cannot create AdaLN cache: %s",
+                 strerror(errno));
+        return 0;
+    }
+    h3_adaln_cache_header header = {
+        .magic = {'H','3','A','D','L','N','1','\0'},
+        .version = 0,
+        .steps = (uint32_t)sigmas->steps,
+        .time_rows = schedule->time_rows,
+        .visual_condition = (uint32_t)(visual_condition != 0),
+        .audio_condition = (uint32_t)(audio_condition != 0),
+        .key = key,
+        .total_bytes = adaln_total_bytes(schedule)
+    };
+    int ok = pwrite(fd, &header, sizeof(header), 0) == (ssize_t)sizeof(header) &&
+             ftruncate(fd, (off_t)header.total_bytes) == 0;
+    close(fd);
+    if (!ok) {
+        snprintf(detail, detail_size, "cannot initialize AdaLN cache: %s",
+                 strerror(errno));
+        return 0;
+    }
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        if (!h3_gpu_tensor_write_file_raw_at(
+                schedule->blocks[block], path,
+                adaln_block_offset(schedule, block), detail, detail_size))
+            return 0;
+    }
+    if (!h3_gpu_tensor_write_file_raw_at(
+            schedule->final, path, adaln_final_offset(schedule),
+            detail, detail_size)) return 0;
+    header.version = 1;
+    fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ok = pwrite(fd, &header, sizeof(header), 0) == (ssize_t)sizeof(header) &&
+         fsync(fd) == 0;
+    close(fd);
+    if (getenv("H3_PROFILE") && ok)
+        fprintf(stderr, "h3: AdaLN cache stored %s (%.1f MiB)\n", path,
+                (double)header.total_bytes / (1024.0 * 1024.0));
+    return ok;
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
@@ -255,6 +469,12 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     float *features = NULL;
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
                       &features, error, error_size)) goto failed;
+    if (adaln_cache_try_load(schedule, sigmas, visual_condition,
+                             audio_condition, progress, progress_opaque,
+                             error, error_size)) {
+        free(features);
+        return schedule;
+    }
     h3_gpu_tensor *time = time_embeddings(weights, gpu, schedule->time_rows,
                                            features, error, error_size);
     free(features);
@@ -328,6 +548,14 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     free_tensor(&final_w);
     free_tensor(&final_b);
     h3_gpu_tensor_free(time);
+    {
+        char cache_detail[384] = {0};
+        if (!adaln_cache_write(schedule, sigmas, visual_condition,
+                               audio_condition, cache_detail,
+                               sizeof(cache_detail)))
+            fprintf(stderr, "h3: warning: AdaLN cache write failed: %s\n",
+                    cache_detail[0] ? cache_detail : "unknown error");
+    }
     return schedule;
 
 failed:

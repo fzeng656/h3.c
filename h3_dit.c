@@ -4,12 +4,16 @@
 #include "h3_weights.h"
 
 #include <math.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 
 enum {
@@ -233,6 +237,166 @@ static void report(h3_dit_progress progress, void *opaque, const char *phase,
 static void free_tensor(h3_gpu_tensor **tensor) {
     h3_gpu_tensor_free(*tensor);
     *tensor = NULL;
+}
+
+
+enum { H3_INT8_PACK_FIELDS = 8 };
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t blocks;
+    uint32_t hidden;
+    uint32_t inner;
+    uint64_t ffn;
+    uint64_t total_bytes;
+} h3_int8_pack_header;
+
+static uint64_t int8_pack_align(uint64_t value) {
+    return (value + UINT64_C(4095)) & ~UINT64_C(4095);
+}
+
+static uint64_t int8_pack_field_size(unsigned field) {
+    static const uint64_t sizes[H3_INT8_PACK_FIELDS] = {
+        (uint64_t)INNER * 3 * HIDDEN,
+        (uint64_t)INNER * 3 * sizeof(float),
+        (uint64_t)HIDDEN * INNER,
+        (uint64_t)HIDDEN * sizeof(float),
+        (uint64_t)FFN * 2 * HIDDEN,
+        (uint64_t)FFN * 2 * sizeof(float),
+        (uint64_t)HIDDEN * FFN,
+        (uint64_t)HIDDEN * sizeof(float)
+    };
+    return field < H3_INT8_PACK_FIELDS ? sizes[field] : 0;
+}
+
+static uint64_t int8_pack_field_offset(unsigned block, unsigned field) {
+    uint64_t offset = UINT64_C(4096);
+    for (unsigned b = 0; b < H3_DIT_BLOCKS; b++) {
+        for (unsigned f = 0; f < H3_INT8_PACK_FIELDS; f++) {
+            offset = int8_pack_align(offset);
+            if (b == block && f == field) return offset;
+            offset += int8_pack_field_size(f);
+        }
+    }
+    return 0;
+}
+
+static uint64_t int8_pack_total_bytes(void) {
+    uint64_t offset = UINT64_C(4096);
+    for (unsigned b = 0; b < H3_DIT_BLOCKS; b++) {
+        for (unsigned f = 0; f < H3_INT8_PACK_FIELDS; f++) {
+            offset = int8_pack_align(offset);
+            offset += int8_pack_field_size(f);
+        }
+    }
+    return int8_pack_align(offset);
+}
+
+static int int8_pack_write_header(const char *path, uint32_t version,
+                                  int truncate_file, char *error,
+                                  size_t error_size) {
+    int flags = O_WRONLY | O_CREAT | O_CLOEXEC;
+    if (truncate_file) flags |= O_TRUNC;
+    int fd = open(path, flags, 0644);
+    if (fd < 0) {
+        fail(error, error_size, "cannot create DiT int8 pack %s: %s",
+             path, strerror(errno));
+        return 0;
+    }
+    h3_int8_pack_header header = {
+        .magic = {'H','3','M','5','I','8','P','\0'},
+        .version = version,
+        .blocks = H3_DIT_BLOCKS,
+        .hidden = HIDDEN,
+        .inner = INNER,
+        .ffn = FFN,
+        .total_bytes = int8_pack_total_bytes()
+    };
+    ssize_t wrote = pwrite(fd, &header, sizeof(header), 0);
+    int ok = wrote == (ssize_t)sizeof(header);
+    if (ok && truncate_file)
+        ok = ftruncate(fd, (off_t)header.total_bytes) == 0;
+    if (ok && version == 1) ok = fsync(fd) == 0;
+    if (!ok)
+        fail(error, error_size, "cannot initialize DiT int8 pack %s: %s",
+             path, strerror(errno));
+    close(fd);
+    return ok;
+}
+
+static int write_int8_block_pack(const char *path, const h3_dit_block *block,
+                                 unsigned index, char *error,
+                                 size_t error_size) {
+    const h3_gpu_tensor *t[H3_INT8_PACK_FIELDS] = {
+        block->qkv_int8, block->qkv_scales, block->out_int8, block->out_scales,
+        block->fc1_int8, block->fc1_scales, block->fc2_int8, block->fc2_scales
+    };
+    for (unsigned f = 0; f < H3_INT8_PACK_FIELDS; f++) {
+        uint64_t offset = int8_pack_field_offset(index, f);
+        if (!t[f] || !offset ||
+            !h3_gpu_tensor_write_file_raw_at(t[f], path, offset,
+                                             error, error_size)) return 0;
+    }
+    return 1;
+}
+
+static int int8_pack_validate(const char *path, char *error,
+                              size_t error_size) {
+    if (!path || !*path) return 0;
+    FILE *stream = fopen(path, "rb");
+    if (!stream) {
+        fail(error, error_size, "cannot open DiT int8 pack %s: %s",
+             path, strerror(errno));
+        return -1;
+    }
+    h3_int8_pack_header header;
+    size_t got = fread(&header, 1, sizeof(header), stream);
+    fclose(stream);
+    static const char magic[8] = {'H','3','M','5','I','8','P','\0'};
+    if (got != sizeof(header) || memcmp(header.magic, magic, sizeof(magic)) ||
+        header.version != 1 || header.blocks != H3_DIT_BLOCKS ||
+        header.hidden != HIDDEN || header.inner != INNER || header.ffn != FFN) {
+        fail(error, error_size, "incompatible DiT int8 pack: %s", path);
+        return -1;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < 0 ||
+        (uint64_t)st.st_size < header.total_bytes) {
+        fail(error, error_size, "truncated DiT int8 pack: %s", path);
+        return -1;
+    }
+    return 1;
+}
+
+static int load_int8_block_pack(h3_dit *dit, h3_dit_block *block,
+                                const char *path, unsigned index,
+                                char *error, size_t error_size) {
+    uint64_t o[H3_INT8_PACK_FIELDS];
+    for (unsigned f = 0; f < H3_INT8_PACK_FIELDS; f++)
+        o[f] = int8_pack_field_offset(index, f);
+    block->qkv_int8 = h3_gpu_tensor_load_i8(
+        dit->gpu, path, o[0], (size_t)INNER * 3 * HIDDEN);
+    block->qkv_scales = h3_gpu_tensor_load_f32(
+        dit->gpu, path, o[1], INNER * 3);
+    block->out_int8 = h3_gpu_tensor_load_i8(
+        dit->gpu, path, o[2], (size_t)HIDDEN * INNER);
+    block->out_scales = h3_gpu_tensor_load_f32(
+        dit->gpu, path, o[3], HIDDEN);
+    block->fc1_int8 = h3_gpu_tensor_load_i8(
+        dit->gpu, path, o[4], (size_t)FFN * 2 * HIDDEN);
+    block->fc1_scales = h3_gpu_tensor_load_f32(
+        dit->gpu, path, o[5], FFN * 2);
+    block->fc2_int8 = h3_gpu_tensor_load_i8(
+        dit->gpu, path, o[6], (size_t)HIDDEN * FFN);
+    block->fc2_scales = h3_gpu_tensor_load_f32(
+        dit->gpu, path, o[7], HIDDEN);
+    if (block->qkv_int8 && block->qkv_scales && block->out_int8 &&
+        block->out_scales && block->fc1_int8 && block->fc1_scales &&
+        block->fc2_int8 && block->fc2_scales) return 1;
+    fail(error, error_size, "cannot load DiT int8 pack block %u: %s",
+         index, h3_gpu_error(dit->gpu));
+    return 0;
 }
 
 static h3_gpu_tensor *bf1(h3_dit *dit, const char *name, uint64_t width,
@@ -1240,6 +1404,22 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
 
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
+    const char *pack_path = getenv("H3_INT8_PACK");
+    const char *pack_out = getenv("H3_INT8_PACK_OUT");
+    int pack = 0;
+    int build_pack = pack_out && *pack_out && !dit->ssd_streaming &&
+                     dit->int8_mlp && dit->int8_qkv && dit->int8_attention_out;
+    double pack_load_seconds = 0.0;
+    double pack_norm_seconds = 0.0;
+    if (build_pack && !int8_pack_write_header(pack_out, 0, 1,
+                                               error, error_size)) return 0;
+    if (pack_path && *pack_path && dit->int8_mlp && dit->int8_qkv &&
+        dit->int8_attention_out) {
+        pack = int8_pack_validate(pack_path, error, error_size);
+        if (pack < 0) return 0;
+        if (pack && getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: using M5 INT8 pack %s\n", pack_path);
+    }
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
@@ -1253,6 +1433,15 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (pack) {
+            double started = stream_now();
+            if (!load_int8_block_pack(dit, &dit->blocks[index], pack_path,
+                                      index, error, error_size)) return 0;
+            pack_load_seconds += stream_now() - started;
+            started = stream_now();
+            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                  error, error_size)) return 0;
+            pack_norm_seconds += stream_now() - started;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -1265,10 +1454,20 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             if (dit->int8_attention_out &&
                 !quantize_block_attention_out(
                     dit, &dit->blocks[index], error, error_size)) return 0;
+            if (build_pack && !write_int8_block_pack(
+                    pack_out, &dit->blocks[index], index,
+                    error, error_size)) return 0;
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
+    if (build_pack && !int8_pack_write_header(pack_out, 1, 0,
+                                               error, error_size)) return 0;
+    if (build_pack && getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: wrote M5 INT8 pack %s\n", pack_out);
+    if (pack && getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: INT8 pack blocks %.3fs + norms %.3fs\n",
+                pack_load_seconds, pack_norm_seconds);
     if (dit->ssd_streaming) {
         if (!allocate_stream_slot(dit, &dit->stream_slots[0],
                                   error, error_size) ||
@@ -1663,25 +1862,40 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
+    double phase_started = stream_now();
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);
+    double phase_refine = stream_now() - phase_started;
     schedule_progress schedule_state = {progress, progress_opaque};
+    phase_started = stream_now();
     dit->schedule = h3_dit_schedule_precompute(
         dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
         dit->audio_condition_rows != 0, schedule_report, &schedule_state,
         error, error_size);
+    double phase_schedule = stream_now() - phase_started;
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
                               H3_DIT_BLOCKS);
     }
+    phase_started = stream_now();
     if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
         !prepare_maps(dit, text, error, error_size) ||
         !prepare_projection_maps(dit, error, error_size) ||
-        !prepare_token_reduction_maps(dit, error, error_size) ||
-        !load_core(dit, progress, progress_opaque, error, error_size) ||
-        !allocate_activations(dit, error, error_size)) goto failed;
+        !prepare_token_reduction_maps(dit, error, error_size)) goto failed;
+    double phase_maps = stream_now() - phase_started;
+    phase_started = stream_now();
+    if (!load_core(dit, progress, progress_opaque, error, error_size)) goto failed;
+    double phase_core = stream_now() - phase_started;
+    phase_started = stream_now();
+    if (!allocate_activations(dit, error, error_size)) goto failed;
+    double phase_activations = stream_now() - phase_started;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr,
+                "h3: DiT prep refine %.3fs schedule %.3fs maps %.3fs core %.3fs activations %.3fs\n",
+                phase_refine, phase_schedule, phase_maps, phase_core,
+                phase_activations);
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
              wanted_video_condition)) ||

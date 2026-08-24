@@ -613,11 +613,17 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     size_t bytes = elements * item_size;
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
+    const char *int8_pack = getenv("H3_INT8_PACK");
+    const char *adaln_cache = getenv("H3_ADALN_CACHE_DIR");
     int transformer_weight = strstr(path, "/transformer/") != NULL;
+    int packed_int8_weight = int8_pack && *int8_pack && !strcmp(path, int8_pack);
+    int adaln_cache_weight = adaln_cache && *adaln_cache &&
+        !strncmp(path, adaln_cache, strlen(adaln_cache)) &&
+        (path[strlen(adaln_cache)] == '/' || path[strlen(adaln_cache)] == '\0');
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
     int map_weight = bytes &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
-         (transformer_weight &&
+         ((transformer_weight || packed_int8_weight || adaln_cache_weight) &&
           ((zero_copy && !strcmp(zero_copy, "transformer")) ||
            (!zero_copy && m5))));
     if (map_weight) {
@@ -717,6 +723,56 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                       uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
                                    sizeof(float), H3_GPU_F32, "F32");
+}
+
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *opaque, const char *path,
+                                     uint64_t file_offset, size_t elements) {
+    return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                   sizeof(int8_t), H3_GPU_I8, "I8");
+}
+
+int h3_gpu_tensor_write_file_raw_at(const h3_gpu_tensor *opaque,
+                                    const char *path, uint64_t file_offset,
+                                    char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!opaque || !path || !*path || file_offset > INT64_MAX) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid raw tensor pwrite");
+        return 0;
+    }
+    H3Tensor *tensor = TENSOR(opaque);
+    if ((uint64_t)tensor.bytes > (uint64_t)INT64_MAX - file_offset) {
+        if (error && error_size)
+            snprintf(error, error_size, "raw tensor pwrite range overflows");
+        return 0;
+    }
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot open %s: %s", path, strerror(errno));
+        return 0;
+    }
+    const unsigned char *src = tensor.buffer.contents;
+    size_t done = 0;
+    while (done < tensor.bytes) {
+        ssize_t n = pwrite(fd, src + done, tensor.bytes - done,
+                           (off_t)(file_offset + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (error && error_size)
+                snprintf(error, error_size, "cannot pwrite %s: %s", path,
+                         n < 0 ? strerror(errno) : "short write");
+            close(fd);
+            return 0;
+        }
+        done += (size_t)n;
+    }
+    if (close(fd) != 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot close %s: %s", path, strerror(errno));
+        return 0;
+    }
+    return 1;
 }
 
 static int h3_gpu_tensor_read_file_bf16_mode(
