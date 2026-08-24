@@ -110,6 +110,7 @@
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3MLP *> *mlpCache;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, H3Conv *> *convCache;
 @property(nonatomic, strong) MPSCommandBuffer *mpsCommand;
+@property(nonatomic, strong) id<MTLBuffer> touchSink;
 @property(nonatomic) BOOL reuseMPSCommandDefault;
 @property(nonatomic, copy) NSString *lastError;
 @property(nonatomic) h3_gpu_stats stats;
@@ -406,7 +407,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
             @"h3_linear_f32_tiled_bf16_map",
             @"h3_cast_f32_to_bf16",
-            @"h3_cast_bf16_to_f32",
+            @"h3_cast_bf16_to_f32", @"h3_touch_pages",
             @"h3_rms_norm_f32",
             @"h3_scale_add_f32", @"h3_layer_norm_f32",
             @"h3_video_qkv_rope_f32",
@@ -614,6 +615,7 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
     const char *int8_pack = getenv("H3_INT8_PACK");
+    const char *int8_pack_copy = getenv("H3_INT8_PACK_COPY");
     const char *adaln_cache = getenv("H3_ADALN_CACHE_DIR");
     int transformer_weight = strstr(path, "/transformer/") != NULL;
     int packed_int8_weight = int8_pack && *int8_pack && !strcmp(path, int8_pack);
@@ -621,7 +623,9 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
         !strncmp(path, adaln_cache, strlen(adaln_cache)) &&
         (path[strlen(adaln_cache)] == '/' || path[strlen(adaln_cache)] == '\0');
     int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
-    int map_weight = bytes &&
+    int packed_copy = packed_int8_weight && int8_pack_copy &&
+        !strcmp(int8_pack_copy, "1");
+    int map_weight = bytes && !packed_copy &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
          ((transformer_weight || packed_int8_weight || adaln_cache_weight) &&
           ((zero_copy && !strcmp(zero_copy, "transformer")) ||
@@ -924,6 +928,51 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
     unsigned char *destination = TENSOR(tensor).buffer.contents;
     memcpy(destination + destination_offset * sizeof(uint16_t), values,
            elements * sizeof(uint16_t));
+    return 1;
+}
+
+int h3_gpu_touch_tensor(h3_gpu *opaque, const h3_gpu_tensor *tensor,
+                        size_t stride_bytes) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !tensor || !h3_gpu_require_command(gpu)) return 0;
+    H3Tensor *object = TENSOR(tensor);
+    if (!object.bytes) return 1;
+    size_t stride_size = stride_bytes ? stride_bytes : (size_t)getpagesize();
+    if (!stride_size || object.bytes > UINT64_MAX - (stride_size - 1)) return 0;
+    uint64_t count64 = ((uint64_t)object.bytes + stride_size - 1) / stride_size;
+    if (!count64 || count64 > UINT32_MAX || stride_size > UINT32_MAX) {
+        h3_gpu_set_error(gpu, @"invalid GPU pre-touch range");
+        return 0;
+    }
+    if (!gpu.touchSink) {
+        gpu.touchSink = [gpu.device newBufferWithLength:sizeof(uint32_t)
+                                              options:MTLResourceStorageModeShared];
+        if (!gpu.touchSink) {
+            h3_gpu_set_error(gpu, @"cannot allocate GPU pre-touch sink");
+            return 0;
+        }
+        *(uint32_t *)gpu.touchSink.contents = 0;
+    }
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, @"h3_touch_pages");
+    if (!pipeline) return 0;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:object.buffer offset:0 atIndex:0];
+        [encoder setBuffer:gpu.touchSink offset:0 atIndex:1];
+        uint64_t bytes = (uint64_t)object.bytes;
+        uint32_t stride = (uint32_t)stride_size;
+        [encoder setBytes:&bytes length:sizeof(bytes) atIndex:2];
+        [encoder setBytes:&stride length:sizeof(stride) atIndex:3];
+        NSUInteger width = MIN((NSUInteger)256,
+                               pipeline.maxTotalThreadsPerThreadgroup);
+        [encoder dispatchThreads:MTLSizeMake((NSUInteger)count64, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
     return 1;
 }
 

@@ -28,6 +28,20 @@ inline ushort4 h3_f32x4_to_bf16(float4 value) {
     return ushort4(bits >> 16);
 }
 
+/* Experimental page pre-touch for file-loaded shared Metal buffers. One thread
+ * reads a byte from each VM page and folds it into a tiny atomic sink, forcing
+ * the GPU to establish access before the first real DiT projection. */
+kernel void h3_touch_pages(device const uchar *input [[buffer(0)]],
+                           device atomic_uint *sink [[buffer(1)]],
+                           constant ulong &bytes [[buffer(2)]],
+                           constant uint &stride [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    ulong offset = ulong(gid) * ulong(stride);
+    if (offset >= bytes) return;
+    uint value = uint(input[offset]) ^ uint(offset);
+    atomic_fetch_xor_explicit(sink, value, memory_order_relaxed);
+}
+
 struct linear_args {
     uint rows;
     uint input_dim;

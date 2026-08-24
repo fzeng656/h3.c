@@ -90,6 +90,10 @@ int h3_gpu_tensor_write_bf16(h3_gpu_tensor *tensor, const uint16_t *values,
 int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
                                    size_t destination_offset,
                                    const uint16_t *values, size_t elements);
+/* Touch one byte per VM page from the GPU. Experimental; used to separate
+ * page-residency cost from the first real inference command. */
+int h3_gpu_touch_tensor(h3_gpu *gpu, const h3_gpu_tensor *tensor,
+                        size_t stride_bytes);
 
 int h3_gpu_begin(h3_gpu *gpu);
 /* Commit the current command buffer without waiting, then continue encoding on

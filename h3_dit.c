@@ -1461,6 +1461,40 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
     }
+    if (pack && getenv("H3_INT8_PRETOUCH")) {
+        double started = stream_now();
+        if (!h3_gpu_begin(dit->gpu)) {
+            fail(error, error_size, "cannot begin INT8 pack GPU pre-touch: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+        for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
+            if (!dit->block_active[index]) continue;
+            const h3_gpu_tensor *weights[] = {
+                dit->blocks[index].qkv_int8,
+                dit->blocks[index].out_int8,
+                dit->blocks[index].fc1_int8,
+                dit->blocks[index].fc2_int8
+            };
+            for (unsigned field = 0; field < 4; field++) {
+                if (!h3_gpu_touch_tensor(dit->gpu, weights[field],
+                                         (size_t)getpagesize())) {
+                    fail(error, error_size,
+                         "cannot pre-touch INT8 pack block %u: %s", index,
+                         h3_gpu_error(dit->gpu));
+                    return 0;
+                }
+            }
+        }
+        if (!h3_gpu_submit(dit->gpu)) {
+            fail(error, error_size, "cannot submit INT8 pack GPU pre-touch: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: INT8 pack GPU pre-touch %.3fs\n",
+                    stream_now() - started);
+    }
     if (build_pack && !int8_pack_write_header(pack_out, 1, 0,
                                                error, error_size)) return 0;
     if (build_pack && getenv("H3_PROFILE"))
