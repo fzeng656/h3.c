@@ -369,6 +369,146 @@ static int int8_pack_validate(const char *path, char *error,
     return 1;
 }
 
+typedef struct {
+    const char *path;
+    h3_gpu_tensor *tensor;
+    uint64_t file_offset;
+    size_t destination_offset;
+    size_t elements;
+    int ok;
+    char error[256];
+} int8_pack_slice_job;
+
+typedef struct {
+    int8_pack_slice_job *jobs;
+    int job_count;
+    int lane;
+    int lanes;
+    int ok;
+    char error[256];
+} int8_pack_worker_job;
+
+static void *int8_pack_slice_worker(void *opaque) {
+    int8_pack_worker_job *worker = opaque;
+    worker->ok = 1;
+    for (int index = worker->lane; index < worker->job_count;
+         index += worker->lanes) {
+        int8_pack_slice_job *job = &worker->jobs[index];
+        job->ok = h3_gpu_tensor_read_file_i8_range(
+            job->tensor, job->path, job->file_offset,
+            job->destination_offset, job->elements,
+            job->error, sizeof(job->error));
+        if (!job->ok) {
+            worker->ok = 0;
+            snprintf(worker->error, sizeof(worker->error), "%s",
+                     job->error[0] ? job->error : "unknown error");
+            break;
+        }
+    }
+    return NULL;
+}
+
+static int int8_pack_worker_count(void) {
+    const char *value = getenv("H3_INT8_PACK_WORKERS");
+    if (!value || !*value) return 4;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (!end || *end || parsed < 1 || parsed > 8) return 4;
+    return (int)parsed;
+}
+
+static int load_int8_block_pack_parallel(h3_dit *dit, h3_dit_block *block,
+                                         const char *path, unsigned index,
+                                         char *error, size_t error_size) {
+    uint64_t o[H3_INT8_PACK_FIELDS];
+    for (unsigned f = 0; f < H3_INT8_PACK_FIELDS; f++)
+        o[f] = int8_pack_field_offset(index, f);
+    block->qkv_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)INNER * 3 * HIDDEN);
+    block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+    block->out_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)HIDDEN * INNER);
+    block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    block->fc1_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)FFN * 2 * HIDDEN);
+    block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+    block->fc2_int8 = h3_gpu_tensor_new_i8(
+        dit->gpu, (size_t)HIDDEN * FFN);
+    block->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    if (!block->qkv_int8 || !block->qkv_scales || !block->out_int8 ||
+        !block->out_scales || !block->fc1_int8 || !block->fc1_scales ||
+        !block->fc2_int8 || !block->fc2_scales) {
+        fail(error, error_size, "cannot allocate parallel DiT pack block %u: %s",
+             index, h3_gpu_error(dit->gpu));
+        return 0;
+    }
+
+    h3_gpu_tensor *weights[4] = {
+        block->qkv_int8, block->out_int8, block->fc1_int8, block->fc2_int8
+    };
+    uint64_t offsets[4] = {o[0], o[2], o[4], o[6]};
+    size_t elements[4] = {
+        (size_t)INNER * 3 * HIDDEN,
+        (size_t)HIDDEN * INNER,
+        (size_t)FFN * 2 * HIDDEN,
+        (size_t)HIDDEN * FFN
+    };
+    int8_pack_slice_job jobs[8];
+    memset(jobs, 0, sizeof(jobs));
+    for (int field = 0; field < 4; field++) {
+        size_t first = elements[field] / 2;
+        size_t second = elements[field] - first;
+        jobs[field * 2] = (int8_pack_slice_job){
+            path, weights[field], offsets[field], 0, first, 0, {0}};
+        jobs[field * 2 + 1] = (int8_pack_slice_job){
+            path, weights[field], offsets[field] + first, first, second, 0, {0}};
+    }
+
+    int lanes = int8_pack_worker_count();
+    pthread_t threads[8];
+    int8_pack_worker_job workers[8];
+    memset(workers, 0, sizeof(workers));
+    int started = 0;
+    for (int lane = 0; lane < lanes; lane++) {
+        workers[lane] = (int8_pack_worker_job){
+            jobs, 8, lane, lanes, 0, {0}};
+        int rc = pthread_create(&threads[lane], NULL, int8_pack_slice_worker,
+                                &workers[lane]);
+        if (rc) {
+            for (int j = 0; j < started; j++)
+                (void)pthread_join(threads[j], NULL);
+            fail(error, error_size,
+                 "cannot start DiT pack I/O thread %d: %s", lane, strerror(rc));
+            return 0;
+        }
+        started++;
+    }
+    for (int lane = 0; lane < lanes; lane++)
+        (void)pthread_join(threads[lane], NULL);
+    for (int lane = 0; lane < lanes; lane++) {
+        if (!workers[lane].ok) {
+            fail(error, error_size, "parallel DiT pack block %u read failed: %s",
+                 index, workers[lane].error[0] ? workers[lane].error :
+                                                "unknown error");
+            return 0;
+        }
+    }
+
+    if (!h3_gpu_tensor_read_file_f32(block->qkv_scales, path, o[1], INNER * 3,
+                                     error, error_size) ||
+        !h3_gpu_tensor_read_file_f32(block->out_scales, path, o[3], HIDDEN,
+                                     error, error_size) ||
+        !h3_gpu_tensor_read_file_f32(block->fc1_scales, path, o[5], FFN * 2,
+                                     error, error_size) ||
+        !h3_gpu_tensor_read_file_f32(block->fc2_scales, path, o[7], HIDDEN,
+                                     error, error_size)) {
+        fail(error, error_size, "parallel DiT pack block %u scale read failed: %s",
+             index, error && *error ? error : "unknown error");
+        return 0;
+    }
+    return 1;
+}
+
 static int load_int8_block_pack(h3_dit *dit, h3_dit_block *block,
                                 const char *path, unsigned index,
                                 char *error, size_t error_size) {
@@ -1435,8 +1575,15 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                 return 0;
         } else if (pack) {
             double started = stream_now();
-            if (!load_int8_block_pack(dit, &dit->blocks[index], pack_path,
-                                      index, error, error_size)) return 0;
+            int parallel_pack = getenv("H3_INT8_PACK_PARALLEL") != NULL;
+            int loaded = parallel_pack ?
+                load_int8_block_pack_parallel(
+                    dit, &dit->blocks[index], pack_path, index,
+                    error, error_size) :
+                load_int8_block_pack(
+                    dit, &dit->blocks[index], pack_path, index,
+                    error, error_size);
+            if (!loaded) return 0;
             pack_load_seconds += stream_now() - started;
             started = stream_now();
             if (!load_block_norms(dit, &dit->blocks[index], prefix,

@@ -784,6 +784,99 @@ int h3_gpu_tensor_write_file_raw_at(const h3_gpu_tensor *opaque,
     return 1;
 }
 
+static int h3_gpu_tensor_read_file_exact(
+                                 h3_gpu_tensor *opaque, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 h3_gpu_dtype dtype, size_t item_size,
+                                 char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!opaque || !path || !*path || TENSOR(opaque).dtype != dtype ||
+        elements != TENSOR(opaque).elements ||
+        elements > SIZE_MAX / item_size || file_offset > INT64_MAX) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid tensor file read request");
+        return 0;
+    }
+    size_t bytes = elements * item_size;
+    if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return 0;
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot open %s: %s", path,
+                     strerror(errno));
+        return 0;
+    }
+    unsigned char *destination = TENSOR(opaque).buffer.contents;
+    size_t completed = 0;
+    while (completed < bytes) {
+        size_t request = MIN(bytes - completed, (size_t)SSIZE_MAX);
+        ssize_t count = pread(descriptor, destination + completed, request,
+                              (off_t)(file_offset + completed));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            int detail = count < 0 ? errno : 0;
+            if (error && error_size)
+                snprintf(error, error_size, "cannot read payload from %s: %s",
+                         path, detail ? strerror(detail) :
+                                        "unexpected end of file");
+            close(descriptor);
+            return 0;
+        }
+        completed += (size_t)count;
+    }
+    close(descriptor);
+    return 1;
+}
+
+
+static int h3_gpu_tensor_read_file_range(
+                                 h3_gpu_tensor *opaque, const char *path,
+                                 uint64_t file_offset, size_t destination_offset,
+                                 size_t elements, h3_gpu_dtype dtype,
+                                 size_t item_size, char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!opaque || !path || !*path || TENSOR(opaque).dtype != dtype ||
+        destination_offset > TENSOR(opaque).elements ||
+        elements > TENSOR(opaque).elements - destination_offset ||
+        elements > SIZE_MAX / item_size ||
+        destination_offset > SIZE_MAX / item_size || file_offset > INT64_MAX) {
+        if (error && error_size)
+            snprintf(error, error_size, "invalid tensor file range read request");
+        return 0;
+    }
+    size_t bytes = elements * item_size;
+    size_t destination_bytes = destination_offset * item_size;
+    if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return 0;
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        if (error && error_size)
+            snprintf(error, error_size, "cannot open %s: %s", path,
+                     strerror(errno));
+        return 0;
+    }
+    unsigned char *destination =
+        (unsigned char *)TENSOR(opaque).buffer.contents + destination_bytes;
+    size_t completed = 0;
+    while (completed < bytes) {
+        size_t request = MIN(bytes - completed, (size_t)SSIZE_MAX);
+        ssize_t count = pread(descriptor, destination + completed, request,
+                              (off_t)(file_offset + completed));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            int detail = count < 0 ? errno : 0;
+            if (error && error_size)
+                snprintf(error, error_size, "cannot read payload from %s: %s",
+                         path, detail ? strerror(detail) :
+                                        "unexpected end of file");
+            close(descriptor);
+            return 0;
+        }
+        completed += (size_t)count;
+    }
+    close(descriptor);
+    return 1;
+}
+
 static int h3_gpu_tensor_read_file_bf16_mode(
                                  h3_gpu_tensor *opaque, const char *path,
                                  uint64_t file_offset, size_t elements,
@@ -844,6 +937,31 @@ int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *opaque, const char *path,
                                  char *error, size_t error_size) {
     return h3_gpu_tensor_read_file_bf16_mode(
         opaque, path, file_offset, elements, 0, error, error_size);
+}
+
+int h3_gpu_tensor_read_file_f32(h3_gpu_tensor *opaque, const char *path,
+                                uint64_t file_offset, size_t elements,
+                                char *error, size_t error_size) {
+    return h3_gpu_tensor_read_file_exact(opaque, path, file_offset, elements,
+                                         H3_GPU_F32, sizeof(float),
+                                         error, error_size);
+}
+
+int h3_gpu_tensor_read_file_i8(h3_gpu_tensor *opaque, const char *path,
+                               uint64_t file_offset, size_t elements,
+                               char *error, size_t error_size) {
+    return h3_gpu_tensor_read_file_exact(opaque, path, file_offset, elements,
+                                         H3_GPU_I8, sizeof(int8_t),
+                                         error, error_size);
+}
+
+int h3_gpu_tensor_read_file_i8_range(h3_gpu_tensor *opaque, const char *path,
+                                     uint64_t file_offset,
+                                     size_t destination_offset, size_t elements,
+                                     char *error, size_t error_size) {
+    return h3_gpu_tensor_read_file_range(
+        opaque, path, file_offset, destination_offset, elements,
+        H3_GPU_I8, sizeof(int8_t), error, error_size);
 }
 
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *opaque, const char *path,
