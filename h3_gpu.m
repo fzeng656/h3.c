@@ -3115,7 +3115,7 @@ static int h3_gpu_linear_int8_bf16_layout(
                             uint32_t headDim) {
     H3GPU *gpu = GPU(opaque);
     uint32_t padded_rows = (rows + 127u) & ~127u;
-    if (!gpu.tensorOpsEnabled || rows < 128 || input_dim % 128 ||
+    if (!gpu.tensorOpsEnabled || !rows || input_dim % 128 ||
         output_dim % 128 ||
         !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
                            @"int8 linear weight") ||

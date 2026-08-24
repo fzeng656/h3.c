@@ -3,11 +3,14 @@
 #include "h3_weights.h"
 
 #include <math.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 enum {
     TEXT_LAYERS = 50,
@@ -119,6 +122,62 @@ static h3_gpu_tensor *load_2d(load_context *load, const char *name,
     return defer(load, h3_weight_load_bf16(load->store, load->gpu, name, 2,
                                             shape, load->error,
                                             load->error_size));
+}
+
+static int load_sparse_embedding_rows(const h3_weight_store *store,
+                                      h3_gpu_tensor *hidden,
+                                      const uint32_t *token_ids,
+                                      size_t token_count,
+                                      char *error, size_t error_size) {
+    const char *name = "model.language_model.embed_tokens.weight";
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || !header || tensor->dtype != H3_DTYPE_BF16 ||
+        tensor->ndim != 2 || tensor->shape[0] != TEXT_VOCAB ||
+        tensor->shape[1] != TEXT_HIDDEN) {
+        fail(error, error_size, "Qwen sparse embedding weight is incompatible");
+        return 0;
+    }
+    int fd = open(header->path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fail(error, error_size, "cannot open Qwen embedding weight: %s",
+             strerror(errno));
+        return 0;
+    }
+    size_t row_bytes = (size_t)TEXT_HIDDEN * sizeof(uint16_t);
+    uint16_t *row = malloc(row_bytes);
+    if (!row) {
+        close(fd);
+        fail(error, error_size, "out of memory reading sparse Qwen embedding");
+        return 0;
+    }
+    int ok = 1;
+    for (size_t index = 0; index < token_count && ok; index++) {
+        uint64_t offset = tensor->file_offset +
+            (uint64_t)token_ids[index] * (uint64_t)row_bytes;
+        size_t done = 0;
+        while (done < row_bytes) {
+            ssize_t got = pread(fd, (unsigned char *)row + done,
+                                row_bytes - done, (off_t)(offset + done));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) {
+                fail(error, error_size, "cannot read Qwen embedding row %u: %s",
+                     token_ids[index], got < 0 ? strerror(errno) :
+                                               "unexpected end of file");
+                ok = 0;
+                break;
+            }
+            done += (size_t)got;
+        }
+        if (ok && !h3_gpu_tensor_write_bf16_range(
+                hidden, index * TEXT_HIDDEN, row, TEXT_HIDDEN)) {
+            fail(error, error_size, "cannot write sparse Qwen embedding row");
+            ok = 0;
+        }
+    }
+    free(row);
+    close(fd);
+    return ok;
 }
 
 static int text_prefetch_threads(void) {
@@ -620,21 +679,45 @@ static int text_encode_bf16_impl(
         goto cleanup;
     }
 
-    h3_gpu_tensor *embedding_weight = load_2d(
-        &load, "model.language_model.embed_tokens.weight", TEXT_VOCAB,
-        TEXT_HIDDEN);
-    if (!embedding_weight) goto cleanup;
-    if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
-                       "command stream begin", -1) ||
-        !gpu_operation(gpu, h3_gpu_embedding_bf16(
-                                 gpu, hidden, embedding_weight, ids, tokens,
-                                 TEXT_VOCAB, TEXT_HIDDEN),
-                       error, error_size, "embedding lookup", -1) ||
-        !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
-                       "embedding stream submit", -1)) {
-        goto cleanup;
+    const char *sparse_embedding = getenv("H3_QWEN_SPARSE_EMBED");
+    if (sparse_embedding && *sparse_embedding && strcmp(sparse_embedding, "0")) {
+        double embedding_started = 0.0;
+        if (getenv("H3_PROFILE")) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+                embedding_started = (double)now.tv_sec +
+                    (double)now.tv_nsec * 1e-9;
+        }
+        if (!load_sparse_embedding_rows(store, hidden, token_ids, token_count,
+                                        error, error_size)) goto cleanup;
+        if (getenv("H3_PROFILE") && embedding_started > 0.0) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                double ended = (double)now.tv_sec +
+                    (double)now.tv_nsec * 1e-9;
+                fprintf(stderr, "h3: Qwen sparse embedding %zu tokens %.3fs (%.2f MiB)\n",
+                        token_count, ended - embedding_started,
+                        (double)token_count * (double)TEXT_HIDDEN * sizeof(uint16_t) /
+                            (1024.0 * 1024.0));
+            }
+        }
+    } else {
+        h3_gpu_tensor *embedding_weight = load_2d(
+            &load, "model.language_model.embed_tokens.weight", TEXT_VOCAB,
+            TEXT_HIDDEN);
+        if (!embedding_weight) goto cleanup;
+        if (!gpu_operation(gpu, h3_gpu_begin(gpu), error, error_size,
+                           "command stream begin", -1) ||
+            !gpu_operation(gpu, h3_gpu_embedding_bf16(
+                                     gpu, hidden, embedding_weight, ids, tokens,
+                                     TEXT_VOCAB, TEXT_HIDDEN),
+                           error, error_size, "embedding lookup", -1) ||
+            !gpu_operation(gpu, h3_gpu_submit(gpu), error, error_size,
+                           "embedding stream submit", -1)) {
+            goto cleanup;
+        }
+        retire_deferred(&load);
     }
-    retire_deferred(&load);
     for (size_t index = 0; index < span_count; index++) {
         const h3_text_vision_span *span = &spans[index];
         if (!h3_gpu_tensor_write_bf16_range(
