@@ -508,6 +508,8 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         return NULL;
     }
     free(fl2va_transformer);
+    ctx->model.generation_profile = ctx->fasth3_v2 ?
+        H3_MODEL_PROFILE_FASTH3 : H3_MODEL_PROFILE_STANDARD;
     char metal_error[256];
     if (!h3_metal_probe(&ctx->device, metal_error, sizeof(metal_error))) {
         h3_set_error(ctx, "%s", metal_error);

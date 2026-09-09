@@ -25,9 +25,9 @@ static void usage(const char *program) {
         "      --height N         Output height (default: 480)\n"
         "      --render-width N   Lower internal model width (optional)\n"
         "      --render-height N  Lower internal model height (optional)\n"
-        "      --frames N         Requested frames (default: 56)\n"
+        "      --frames N         Requested frames (default: 56; FastH3: 124)\n"
         "      --seconds N        Requested duration at 24 fps (instead of --frames)\n"
-        "      --steps N          Denoising passes (default: 20)\n"
+        "      --steps N          Denoising passes (default: 20; FastH3: 4)\n"
         "      --reuse N          Denoiser reuse: 1 close, 2 fast, 3 aggressive\n"
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
@@ -134,6 +134,9 @@ static void print_info(const h3_ctx *ctx) {
     printf("  Apple GPU family      %d\n", device->apple_gpu_family);
     printf("  Metal 4               %s\n", device->metal4 ? "yes" : "no");
     printf("  unified memory        %s\n", device->unified_memory ? "yes" : "no");
+    printf("  generation profile    %s\n",
+           model->generation_profile == H3_MODEL_PROFILE_FASTH3 ?
+               "FastH3 v2 VSA (default 124f / 4-step)" : "standard");
     printf("Native checkpoint inventory (header-only):\n");
     print_component("Qwen3-VL encoder", &model->text_encoder);
     print_component("FL2VA DiT", &model->fl2va_transformer);
@@ -319,6 +322,7 @@ int main(int argc, char **argv) {
     int info = 0;
     int frames_given = 0;
     int seconds_given = 0;
+    int steps_given = 0;
     int seed_given = 0;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
@@ -343,7 +347,10 @@ int main(int argc, char **argv) {
                 params.frames = frames_from_seconds(optarg);
                 seconds_given = 1;
                 break;
-            case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
+            case OPT_STEPS:
+                params.steps = parse_int(optarg, "steps");
+                steps_given = 1;
+                break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
@@ -491,6 +498,11 @@ int main(int argc, char **argv) {
     if (!ctx) {
         fprintf(stderr, "h3: %s\n", h3_last_error(NULL));
         return 1;
+    }
+    const h3_model_info *loaded_model = h3_model(ctx);
+    if (loaded_model && loaded_model->generation_profile == H3_MODEL_PROFILE_FASTH3) {
+        if (!steps_given) params.steps = 4;
+        if (!frames_given && !seconds_given) params.frames = 124;
     }
     if (info) print_info(ctx);
     if (prompt) {

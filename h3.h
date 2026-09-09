@@ -152,12 +152,18 @@ typedef struct {
     size_t tensors;
 } h3_component_info;
 
+typedef enum {
+    H3_MODEL_PROFILE_STANDARD = 0,
+    H3_MODEL_PROFILE_FASTH3 = 1
+} h3_model_profile;
+
 typedef struct {
     h3_component_info text_encoder;
     h3_component_info fl2va_transformer;
     h3_component_info ref2va_transformer;
     h3_component_info video_vae;
     h3_component_info audio_vae;
+    h3_model_profile generation_profile;
 } h3_model_info;
 
 struct h3_result {
