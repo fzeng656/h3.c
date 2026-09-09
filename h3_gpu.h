@@ -34,14 +34,18 @@ typedef struct {
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
+h3_gpu *h3_gpu_create_with_sparse_attention(const char *shader_source_path,
+                      char *error, size_t error_size);
 void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
+int h3_gpu_has_vsa_attention(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_new_u32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
                                       size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
@@ -548,6 +552,18 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales);
+/* Learned FastH3 VSA tile-64 attention. Scratch tensors are caller-owned. */
+int h3_gpu_vsa_attention_bf16(
+    h3_gpu *gpu, h3_gpu_tensor *output,
+    const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+    const h3_gpu_tensor *value, const h3_gpu_tensor *gate,
+    h3_gpu_tensor *tiled_qkvg, h3_gpu_tensor *pooled_qkv,
+    h3_gpu_tensor *selected_video_tiles,
+    const h3_gpu_tensor *block_sizes, const h3_gpu_tensor *tiled_to_packed,
+    uint32_t sequence, uint32_t padded_rows, uint32_t tiles,
+    uint32_t prefix_tiles, uint32_t video_tiles, uint32_t topk,
+    uint32_t heads, uint32_t head_dim, float scale);
+
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

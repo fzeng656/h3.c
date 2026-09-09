@@ -329,8 +329,9 @@ static int h3_gpu_dispatch_rows(H3GPU *gpu, NSString *name, uint32_t rows,
     return 1;
 }
 
-h3_gpu *h3_gpu_create(const char *shader_source_path,
-                      char *error, size_t error_size) {
+static h3_gpu *h3_gpu_create_internal(const char *shader_source_path,
+                                      BOOL wantsSparseAttention,
+                                      char *error, size_t error_size) {
     @autoreleasepool {
         H3GPU *gpu = [[H3GPU alloc] init];
         gpu.profileLabel = @"Metal context";
@@ -505,9 +506,60 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             }
             pipelines[name] = pipeline;
         }
+        if (wantsSparseAttention) {
+            NSString *dir = [path stringByDeletingLastPathComponent];
+            NSString *sparsePath = [dir stringByAppendingPathComponent:@"h3_sol_attention.metal"];
+            NSError *sparseError = nil;
+            NSString *sparseSource = [NSString stringWithContentsOfFile:sparsePath
+                                                               encoding:NSUTF8StringEncoding
+                                                                  error:&sparseError];
+            MTLCompileOptions *sparseOptions = [[MTLCompileOptions alloc] init];
+            sparseOptions.mathMode = MTLMathModeSafe;
+            id<MTLLibrary> sparseLibrary = sparseSource ?
+                [gpu.device newLibraryWithSource:sparseSource options:sparseOptions error:&sparseError] : nil;
+            NSArray<NSString *> *sparseNames = @[
+                @"h3_vsa_pack_qkvg_bf16",
+                @"h3_vsa_pool_qkv_bf16_d128",
+                @"h3_vsa_route_compress_f32_d128",
+                @"h3_vsa_attn_tiled_bf16_d128_bq64"
+            ];
+            if (!sparseLibrary) {
+                if (error && error_size) {
+                    const char *description = sparseError.localizedDescription.UTF8String;
+                    snprintf(error, error_size, "cannot compile %s: %s",
+                             sparsePath.UTF8String, description ? description : "unknown error");
+                }
+                return NULL;
+            }
+            for (NSString *name in sparseNames) {
+                id<MTLFunction> function = [sparseLibrary newFunctionWithName:name];
+                NSError *pipelineError = nil;
+                id<MTLComputePipelineState> pipeline = function ?
+                    [gpu.device newComputePipelineStateWithFunction:function error:&pipelineError] : nil;
+                if (!pipeline) {
+                    if (error && error_size) {
+                        const char *description = pipelineError.localizedDescription.UTF8String;
+                        snprintf(error, error_size, "cannot build %s: %s", name.UTF8String,
+                                 description ? description : "function missing");
+                    }
+                    return NULL;
+                }
+                pipelines[name] = pipeline;
+            }
+        }
         gpu.pipelines = pipelines;
         return (__bridge_retained h3_gpu *)gpu;
     }
+}
+
+h3_gpu *h3_gpu_create(const char *shader_source_path,
+                      char *error, size_t error_size) {
+    return h3_gpu_create_internal(shader_source_path, NO, error, error_size);
+}
+
+h3_gpu *h3_gpu_create_with_sparse_attention(const char *shader_source_path,
+                      char *error, size_t error_size) {
+    return h3_gpu_create_internal(shader_source_path, YES, error, error_size);
 }
 
 void h3_gpu_free(h3_gpu *gpu) {
@@ -552,6 +604,15 @@ int h3_gpu_has_int8_mlp(const h3_gpu *opaque) {
     return gpu.tensorOpsEnabled;
 }
 
+int h3_gpu_has_vsa_attention(const h3_gpu *opaque) {
+    if (!opaque) return 0;
+    H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
+    return gpu.pipelines[@"h3_vsa_pack_qkvg_bf16"] != nil &&
+           gpu.pipelines[@"h3_vsa_pool_qkv_bf16_d128"] != nil &&
+           gpu.pipelines[@"h3_vsa_route_compress_f32_d128"] != nil &&
+           gpu.pipelines[@"h3_vsa_attn_tiled_bf16_d128_bq64"] != nil;
+}
+
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
                                         size_t elements, size_t item_size,
                                         h3_gpu_dtype dtype) {
@@ -590,6 +651,10 @@ h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements) {
 
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements) {
     return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(int8_t), H3_GPU_I8);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_new_u32(h3_gpu *gpu, size_t elements) {
+    return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(uint32_t), H3_GPU_U32);
 }
 
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
@@ -1211,6 +1276,11 @@ typedef struct { uint32_t rows, columns, group_size, groups; }
 typedef struct {
     uint32_t rows, input_dim, output_dim, group_size, groups;
 } int8_group_linear_args;
+typedef struct {
+    uint32_t sequence, padded_rows, tiles, prefix_tiles, video_tiles;
+    uint32_t topk, heads, head_dim;
+    float scale;
+} h3_vsa_args;
 typedef struct { uint32_t rows, width; float epsilon; } norm_args;
 typedef struct {
     uint32_t rows, width, slots, shift_slot, scale_slot;
@@ -2633,6 +2703,150 @@ static int h3_gpu_require_f32(H3GPU *gpu, const h3_gpu_tensor *tensor,
     }
     return 1;
 }
+
+static int h3_gpu_require_u32(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                              size_t elements, NSString *label) {
+    if (!h3_gpu_require_elements(gpu, tensor, elements, label)) return 0;
+    if (TENSOR(tensor).dtype != H3_GPU_U32) {
+        h3_gpu_set_error(gpu, @"%@ tensor is not U32", label);
+        return 0;
+    }
+    return 1;
+}
+
+int h3_gpu_vsa_attention_bf16(
+                                h3_gpu *opaque, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value,
+                                const h3_gpu_tensor *gate,
+                                h3_gpu_tensor *tiled_qkvg,
+                                h3_gpu_tensor *pooled_qkv,
+                                h3_gpu_tensor *selected_video_tiles,
+                                const h3_gpu_tensor *block_sizes,
+                                const h3_gpu_tensor *tiled_to_packed,
+                                uint32_t sequence, uint32_t padded_rows,
+                                uint32_t tiles, uint32_t prefix_tiles,
+                                uint32_t video_tiles, uint32_t topk,
+                                uint32_t heads, uint32_t head_dim,
+                                float scale) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || head_dim != 128 || !sequence || !padded_rows || !tiles ||
+        !video_tiles || prefix_tiles + video_tiles != tiles || !topk ||
+        topk > video_tiles || padded_rows != tiles * 64u ||
+        !isfinite(scale) || !(scale > 0.0f)) return 0;
+    if ((size_t)heads > SIZE_MAX / head_dim) return 0;
+    size_t width = (size_t)heads * head_dim;
+    if ((size_t)sequence > SIZE_MAX / width ||
+        (size_t)padded_rows > SIZE_MAX / width) return 0;
+    size_t packed_count = (size_t)sequence * width;
+    size_t tiled_section = (size_t)padded_rows * width;
+    if (tiled_section > SIZE_MAX / 4u ||
+        (size_t)heads > SIZE_MAX / tiles / head_dim) return 0;
+    size_t summary_count = (size_t)heads * tiles * head_dim;
+    if (summary_count > (SIZE_MAX - 1u) / 2u ||
+        summary_count > (SIZE_MAX - (summary_count + 1u) / 2u) / 3u ||
+        (size_t)heads > SIZE_MAX / video_tiles / topk) return 0;
+    size_t pooled_count = summary_count * 3u + (summary_count + 1u) / 2u;
+    size_t selected_count = (size_t)heads * video_tiles * topk;
+    if (!h3_gpu_require_bf16(gpu, query, packed_count, @"VSA query") ||
+        !h3_gpu_require_bf16(gpu, key, packed_count, @"VSA key") ||
+        !h3_gpu_require_bf16(gpu, value, packed_count, @"VSA value") ||
+        !h3_gpu_require_bf16(gpu, gate, packed_count, @"VSA gate") ||
+        !h3_gpu_require_bf16(gpu, output, packed_count, @"VSA output") ||
+        !h3_gpu_require_bf16(gpu, tiled_qkvg, tiled_section * 4u,
+                             @"VSA tiled QKVG") ||
+        !h3_gpu_require_f32(gpu, pooled_qkv, pooled_count,
+                            @"VSA pooled QKV/compression") ||
+        !h3_gpu_require_u32(gpu, selected_video_tiles, selected_count,
+                            @"VSA selected video tiles") ||
+        !h3_gpu_require_u32(gpu, block_sizes, tiles, @"VSA block sizes") ||
+        !h3_gpu_require_u32(gpu, tiled_to_packed, padded_rows,
+                            @"VSA tiled row map") ||
+        !h3_gpu_require_command(gpu)) return 0;
+
+    id<MTLComputePipelineState> pack = h3_gpu_pipeline(
+        gpu, @"h3_vsa_pack_qkvg_bf16");
+    id<MTLComputePipelineState> pool = h3_gpu_pipeline(
+        gpu, @"h3_vsa_pool_qkv_bf16_d128");
+    id<MTLComputePipelineState> route = h3_gpu_pipeline(
+        gpu, @"h3_vsa_route_compress_f32_d128");
+    id<MTLComputePipelineState> attention = h3_gpu_pipeline(
+        gpu, @"h3_vsa_attn_tiled_bf16_d128_bq64");
+    NSUInteger score_bytes = (NSUInteger)tiles * sizeof(float);
+    if (!pack || !pool || !route || !attention ||
+        pool.maxTotalThreadsPerThreadgroup < 128 ||
+        route.maxTotalThreadsPerThreadgroup < 128 ||
+        attention.maxTotalThreadsPerThreadgroup < 256 ||
+        route.staticThreadgroupMemoryLength + score_bytes >
+            gpu.device.maxThreadgroupMemoryLength ||
+        tiled_section * 4u > UINT32_MAX) {
+        h3_gpu_set_error(gpu,
+                         @"device cannot dispatch learned VSA-H3 attention");
+        return 0;
+    }
+
+    h3_vsa_args args = {
+        sequence, padded_rows, tiles, prefix_tiles, video_tiles, topk,
+        heads, head_dim, scale
+    };
+    NSUInteger compressed_offset = summary_count * 3u * sizeof(float);
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pack];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(gate).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(tiled_qkvg).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(tiled_to_packed).buffer offset:0 atIndex:5];
+        [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        [encoder dispatchThreads:MTLSizeMake(tiled_section * 4u, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:pool];
+        [encoder setBuffer:TENSOR(tiled_qkvg).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(pooled_qkv).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(block_sizes).buffer offset:0 atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:route];
+        [encoder setBuffer:TENSOR(pooled_qkv).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(selected_video_tiles).buffer
+                     offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(pooled_qkv).buffer
+                     offset:compressed_offset atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:attention];
+        [encoder setBuffer:TENSOR(tiled_qkvg).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(selected_video_tiles).buffer
+                     offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(pooled_qkv).buffer
+                     offset:compressed_offset atIndex:2];
+        [encoder setBuffer:TENSOR(block_sizes).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(tiled_to_packed).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:5];
+        [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += 4;
+    gpu.stats = stats;
+    return 1;
+}
+
 
 static H3Linear *h3_gpu_linear_graph(H3GPU *gpu, uint32_t rows,
                                      uint32_t input_dim, uint32_t output_dim,
