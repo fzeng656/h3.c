@@ -14,6 +14,7 @@ struct h3_ctx {
     char error[512];
     h3_device_info device;
     h3_model_info model;
+    int fasth3_v2;
     int cache_enabled;
     char *conditioning_key;
     size_t conditioning_tokens;

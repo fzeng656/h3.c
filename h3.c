@@ -10,6 +10,7 @@
 #include "h3_tokenizer.h"
 #include "h3_video_encoder.h"
 #include "h3_video_vae.h"
+#include "h3_weights.h"
 #include "h3_vision_encoder.h"
 
 #include <errno.h>
@@ -404,6 +405,47 @@ static int h3_inventory(h3_ctx *ctx, const char *relative,
     return ok;
 }
 
+static int h3_probe_fasth3_v2(const char *transformer_dir,
+                                int *enabled,
+                                char *error, size_t error_size) {
+    if (enabled) *enabled = 0;
+    h3_weight_store *weights = h3_weight_store_open(
+        transformer_dir, error, error_size);
+    if (!weights) return 0;
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *marker = h3_weight_find(
+        weights, "h3.fasth3.version", &header);
+    if (!marker) {
+        h3_weight_store_free(weights);
+        return 1;
+    }
+    unsigned char bytes[4];
+    int ok = header && marker->dtype == H3_DTYPE_U32 && marker->ndim == 1 &&
+             marker->shape[0] == 1 &&
+             h3_st_read_data(header, marker, bytes, sizeof(bytes),
+                             error, error_size);
+    if (!ok) {
+        if (error && error_size && !error[0])
+            snprintf(error, error_size, "invalid FastH3 version marker");
+        h3_weight_store_free(weights);
+        return 0;
+    }
+    uint32_t version = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+                       ((uint32_t)bytes[2] << 16) |
+                       ((uint32_t)bytes[3] << 24);
+    if (version != 2u) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "this runtime expects FastH3 VSA package version 2, got %u",
+                     version);
+        h3_weight_store_free(weights);
+        return 0;
+    }
+    if (enabled) *enabled = 1;
+    h3_weight_store_free(weights);
+    return 1;
+}
+
 h3_ctx *h3_load_dir(const char *model_dir) {
     h3_global_error[0] = '\0';
     if (!model_dir || !*model_dir) {
@@ -449,6 +491,23 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         h3_free(ctx);
         return NULL;
     }
+    char *fl2va_transformer = h3_path(ctx->model_dir, "FL2VA/transformer");
+    if (!fl2va_transformer) {
+        h3_set_error(ctx, "out of memory resolving FL2VA transformer path");
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
+        return NULL;
+    }
+    char fast_error[384] = {0};
+    if (!h3_probe_fasth3_v2(fl2va_transformer, &ctx->fasth3_v2,
+                             fast_error, sizeof(fast_error))) {
+        free(fl2va_transformer);
+        h3_set_error(ctx, "%s", fast_error);
+        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
+        h3_free(ctx);
+        return NULL;
+    }
+    free(fl2va_transformer);
     char metal_error[256];
     if (!h3_metal_probe(&ctx->device, metal_error, sizeof(metal_error))) {
         h3_set_error(ctx, "%s", metal_error);
@@ -518,6 +577,25 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     if (params->steps < 2 || params->steps > H3_MAX_STEPS) {
         h3_set_error(ctx, "denoising steps must be in [2, 1000]");
         return 0;
+    }
+    if (ctx->fasth3_v2) {
+        int aligned_frames = h3_align_frame_count(params->frames);
+        int short_edge = params->width < params->height ?
+            params->width : params->height;
+        if (params->steps != 4 || params->dit_layers != H3_DEFAULT_DIT_LAYERS ||
+            params->core_reuse != 1 || params->token_reduction ||
+            params->ssd_streaming || params->reference_count ||
+            params->first_frame || params->last_frame) {
+            h3_set_error(ctx,
+                "FastH3 v2 requires 4-step, 50-block T2VA without reuse, "
+                "token reduction, SSD streaming, or references");
+            return 0;
+        }
+        if (short_edge < 480 || aligned_frames < 124 || aligned_frames > 362) {
+            h3_set_error(ctx,
+                "FastH3 v2 requires short edge >= 480 and 124..362 aligned frames");
+            return 0;
+        }
     }
     if (params->denoise_reuse < 1 || params->denoise_reuse > 3) {
         h3_set_error(ctx, "denoise reuse must be in [1, 3]");
