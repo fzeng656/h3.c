@@ -2,6 +2,7 @@
 
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
+#include "h3_vsa_geometry.h"
 
 #include <math.h>
 #include <errno.h>
@@ -39,6 +40,8 @@ typedef struct {
     h3_gpu_tensor *qkv;
     h3_gpu_tensor *qkv_int8;
     h3_gpu_tensor *qkv_scales;
+    h3_gpu_tensor *vsa_gate_int8;
+    h3_gpu_tensor *vsa_gate_scales;
     h3_gpu_tensor *q_norm;
     h3_gpu_tensor *k_norm;
     h3_gpu_tensor *out;
@@ -80,6 +83,11 @@ struct h3_dit {
     int int8_mlp;
     int int8_qkv;
     int int8_attention_out;
+    int prequantized_int8;
+    int input_major_transformer;
+    int vsa_attention;
+    h3_vsa_geometry vsa_geometry;
+    uint32_t vsa_topk;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
     int use_slower_row_major_attention_output;
@@ -172,6 +180,11 @@ struct h3_dit {
     h3_gpu_tensor *value;
     h3_gpu_tensor *attention_heads;
     h3_gpu_tensor *attention_output;
+    h3_gpu_tensor *vsa_block_sizes;
+    h3_gpu_tensor *vsa_tiled_to_packed;
+    h3_gpu_tensor *vsa_tiled_qkvg;
+    h3_gpu_tensor *vsa_pooled_qkv;
+    h3_gpu_tensor *vsa_selected_video_tiles;
     h3_gpu_tensor *token_pool_pairs;
     h3_gpu_tensor *token_baseline_indices;
     h3_gpu_tensor *token_expand_parents;
@@ -846,12 +859,44 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
+static int load_prequantized_block(h3_dit *dit, h3_dit_block *block,
+                                   const char *prefix,
+                                   char *error, size_t error_size) {
+    char name[160];
+    if (!load_block_norms(dit, block, prefix, error, error_size)) return 0;
+#define LOAD_IM(weight_field, scale_field, suffix, input_dim, output_dim) do { \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                      \
+    if (!h3_weight_load_i8_linear_input_major(                                  \
+            dit->weights, dit->gpu, name, input_dim, output_dim,                \
+            &block->weight_field, &block->scale_field, error, error_size))      \
+        return 0;                                                                \
+    uint32_t convrot_group = 0;                                                  \
+    if (!h3_weight_i8_linear_convrot_group(                                      \
+            dit->weights, name, &convrot_group, error, error_size)) return 0;   \
+    if (convrot_group) {                                                         \
+        fail(error, error_size,                                                  \
+             "FastH3 v2 ConvRot group %u is not wired in this runtime yet: %s",\
+             convrot_group, name);                                               \
+        return 0;                                                                \
+    }                                                                            \
+} while (0)
+    LOAD_IM(qkv_int8, qkv_scales, "attn.qkv_proj.weight", HIDDEN, INNER * 3);
+    LOAD_IM(vsa_gate_int8, vsa_gate_scales, "attn.vsa_gate.weight", HIDDEN, INNER);
+    LOAD_IM(out_int8, out_scales, "attn.out_proj.weight", INNER, HIDDEN);
+    LOAD_IM(fc1_int8, fc1_scales, "mlp.fc1.weight", HIDDEN, FFN * 2);
+    LOAD_IM(fc2_int8, fc2_scales, "mlp.fc2.weight", FFN, HIDDEN);
+#undef LOAD_IM
+    return 1;
+}
+
 static void free_block(h3_dit_block *block) {
     free_tensor(&block->norm1);
     free_tensor(&block->norm2);
     free_tensor(&block->qkv);
     free_tensor(&block->qkv_int8);
     free_tensor(&block->qkv_scales);
+    free_tensor(&block->vsa_gate_int8);
+    free_tensor(&block->vsa_gate_scales);
     free_tensor(&block->q_norm);
     free_tensor(&block->k_norm);
     free_tensor(&block->out);
@@ -869,6 +914,130 @@ static double stream_now(void) {
     struct timespec value;
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
     return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
+
+static uint32_t h3_little_u32(const unsigned char bytes[4]) {
+    uint32_t value = 0;
+    for (unsigned index = 0; index < 4; index++)
+        value |= (uint32_t)bytes[index] << (index * 8u);
+    return value;
+}
+
+static int read_singleton_marker(const h3_weight_store *store,
+                                 const char *name, h3_dtype dtype,
+                                 unsigned char *bytes, size_t byte_count,
+                                 char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || !header || tensor->dtype != dtype || tensor->ndim != 1 ||
+        tensor->shape[0] != 1 || h3_dtype_size(dtype) != byte_count ||
+        !h3_st_read_data(header, tensor, bytes, byte_count, error, error_size)) {
+        if (!error || !error[0])
+            fail(error, error_size, "checkpoint marker is invalid: %s", name);
+        return 0;
+    }
+    return 1;
+}
+
+static int read_u32_marker(const h3_weight_store *store, const char *name,
+                           uint32_t *value, char *error, size_t error_size) {
+    unsigned char bytes[4];
+    if (!read_singleton_marker(store, name, H3_DTYPE_U32, bytes,
+                               sizeof(bytes), error, error_size)) return 0;
+    *value = h3_little_u32(bytes);
+    return 1;
+}
+
+static int validate_input_major_weight(const h3_dit *dit, unsigned layer,
+                                       const char *suffix,
+                                       uint64_t input_columns,
+                                       uint64_t output_rows,
+                                       char *error, size_t error_size) {
+    char name[160];
+    int n = snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);
+    if (n < 0 || (size_t)n >= sizeof(name)) {
+        fail(error, error_size, "input-major DiT weight name is too long");
+        return 0;
+    }
+    const h3_st_tensor *tensor = h3_weight_find(dit->weights, name, NULL);
+    if (!tensor || tensor->dtype != H3_DTYPE_I8 || tensor->ndim != 2 ||
+        tensor->shape[0] != input_columns || tensor->shape[1] != output_rows) {
+        fail(error, error_size, "input-major DiT tensor has wrong schema: %s", name);
+        return 0;
+    }
+    return 1;
+}
+
+static int configure_fast_h3_v2(h3_dit *dit, char *error, size_t error_size) {
+    const h3_st_tensor *marker = h3_weight_find(dit->weights, "h3.fasth3.version", NULL);
+    if (!marker) return 1;
+    uint32_t version = 0, layout_version = 0, tile_size = 0;
+    unsigned char sparsity_bytes[sizeof(float)];
+    float sparsity = 0.0f;
+    if (!read_u32_marker(dit->weights, "h3.fasth3.version", &version,
+                         error, error_size)) return 0;
+    if (version == 1) return 1;
+    if (version != 2) {
+        fail(error, error_size, "unsupported FastH3 package version %u", version);
+        return 0;
+    }
+    if (!read_u32_marker(dit->weights, "h3.transformer_input_major.version",
+                         &layout_version, error, error_size) ||
+        layout_version != 1u ||
+        !read_u32_marker(dit->weights, "h3.fasth3.vsa.tile_size", &tile_size,
+                         error, error_size) ||
+        !read_singleton_marker(dit->weights, "h3.fasth3.vsa.sparsity",
+                               H3_DTYPE_F32, sparsity_bytes,
+                               sizeof(sparsity_bytes), error, error_size))
+        return 0;
+    memcpy(&sparsity, sparsity_bytes, sizeof(sparsity));
+    if (tile_size != 64u || fabsf(sparsity - 0.9f) > 1.0e-6f ||
+        !dit->prequantized_int8) {
+        fail(error, error_size,
+             "FastH3 v2 requires input-major INT8, tile-64 and 90%% sparsity");
+        return 0;
+    }
+    if (dit->active_block_count != H3_DIT_BLOCKS || dit->core_reuse_interval != 1 ||
+        dit->token_reduction || dit->ssd_streaming || dit->video_condition_rows ||
+        dit->audio_condition_rows ||
+        dit->video_target_start != dit->text_rows + dit->audio_total_rows ||
+        dit->video_target_start + dit->video_rows != dit->sequence) {
+        fail(error, error_size,
+             "FastH3 v2 requires exact 50-block T2VA path without reuse/reduction/conditioning");
+        return 0;
+    }
+    for (unsigned layer = 0; layer < H3_DIT_BLOCKS; layer++) {
+        if (!validate_input_major_weight(dit, layer, "attn.qkv_proj.weight",
+                                         HIDDEN, INNER * 3, error, error_size) ||
+            !validate_input_major_weight(dit, layer, "attn.vsa_gate.weight",
+                                         HIDDEN, INNER, error, error_size) ||
+            !validate_input_major_weight(dit, layer, "attn.out_proj.weight",
+                                         INNER, HIDDEN, error, error_size) ||
+            !validate_input_major_weight(dit, layer, "mlp.fc1.weight",
+                                         HIDDEN, FFN * 2, error, error_size) ||
+            !validate_input_major_weight(dit, layer, "mlp.fc2.weight",
+                                         FFN, HIDDEN, error, error_size)) return 0;
+    }
+    uint32_t prefix_segments[] = {dit->text_rows, 0u, dit->audio_total_rows};
+    if (!h3_vsa_geometry_build(prefix_segments, 3,
+            (uint32_t)dit->latent_t, (uint32_t)dit->latent_h / 2u,
+            (uint32_t)dit->latent_w / 2u, &dit->vsa_geometry,
+            error, error_size)) return 0;
+    if (dit->vsa_geometry.sequence != dit->sequence || !dit->vsa_geometry.video_tiles) {
+        h3_vsa_geometry_free(&dit->vsa_geometry);
+        fail(error, error_size, "FastH3 VSA geometry does not match packed sequence");
+        return 0;
+    }
+    dit->vsa_topk = (dit->vsa_geometry.video_tiles + 9u) / 10u;
+    if (!dit->vsa_topk) dit->vsa_topk = 1u;
+    dit->input_major_transformer = 1;
+    dit->vsa_attention = 1;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: FastH3 v2 VSA enabled (%u prefix + %u video tiles, top-k %u)\n",
+                dit->vsa_geometry.prefix_tiles, dit->vsa_geometry.video_tiles,
+                dit->vsa_topk);
+    return 1;
 }
 
 static int compare_stream_sources(const void *left, const void *right) {
@@ -1568,7 +1737,10 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         }
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
-        if (dit->ssd_streaming) {
+        if (dit->prequantized_int8) {
+            if (!load_prequantized_block(dit, &dit->blocks[index], prefix,
+                                         error, error_size)) return 0;
+        } else if (dit->ssd_streaming) {
             if (!load_block_norms(dit, &dit->blocks[index], prefix,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
@@ -1766,6 +1938,31 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
     for (size_t index = 0; index < sizeof(all) / sizeof(*all); index++) {
         if (!all[index]) {
             fail(error, error_size, "cannot allocate DiT activation arena: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
+    if (dit->vsa_attention) {
+        size_t padded = dit->vsa_geometry.padded_rows;
+        size_t tiles = dit->vsa_geometry.tiles;
+        size_t summaries = (size_t)HEADS * tiles * HEAD_DIM;
+        size_t pooled = summaries * 3u + (summaries + 1u) / 2u;
+        size_t selected = (size_t)HEADS * dit->vsa_geometry.video_tiles *
+                          dit->vsa_topk;
+        dit->vsa_block_sizes = h3_gpu_tensor_from_u32(
+            dit->gpu, dit->vsa_geometry.block_sizes, tiles);
+        dit->vsa_tiled_to_packed = h3_gpu_tensor_from_u32(
+            dit->gpu, dit->vsa_geometry.tiled_to_packed, padded);
+        dit->vsa_tiled_qkvg = h3_gpu_tensor_new_bf16(
+            dit->gpu, padded * INNER * 4u);
+        dit->vsa_pooled_qkv = h3_gpu_tensor_new_f32(dit->gpu, pooled);
+        dit->vsa_selected_video_tiles = h3_gpu_tensor_new_u32(
+            dit->gpu, selected);
+        if (!dit->vsa_block_sizes || !dit->vsa_tiled_to_packed ||
+            !dit->vsa_tiled_qkvg || !dit->vsa_pooled_qkv ||
+            !dit->vsa_selected_video_tiles) {
+            fail(error, error_size,
+                 "cannot allocate FastH3 VSA attention buffers: %s",
                  h3_gpu_error(dit->gpu));
             return 0;
         }
@@ -2007,16 +2204,37 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
-    dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
+    const h3_st_tensor *core_qkv = h3_weight_find(
+        dit->weights, "blocks.0.attn.qkv_proj.weight", NULL);
+    if (!core_qkv || (core_qkv->dtype != H3_DTYPE_BF16 &&
+                      core_qkv->dtype != H3_DTYPE_I8)) {
+        fail(error, error_size, "DiT core QKV must use BF16 or I8 weights");
+        goto failed;
+    }
+    dit->prequantized_int8 = core_qkv->dtype == H3_DTYPE_I8;
+    if (!configure_fast_h3_v2(dit, error, error_size)) goto failed;
+    if (dit->prequantized_int8 && !dit->vsa_attention) {
+        fail(error, error_size,
+             "pre-quantized input-major DiT is only supported for FastH3 v2");
+        goto failed;
+    }
+    if (dit->prequantized_int8) dit->fused_mlp = 0;
+    dit->gpu = dit->vsa_attention
+        ? h3_gpu_create_with_sparse_attention(shader_source_path, error, error_size)
+        : h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    if (dit->vsa_attention && !h3_gpu_has_vsa_attention(dit->gpu)) {
+        fail(error, error_size, "FastH3 v2 requires VSA Metal kernels");
+        goto failed;
+    }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
-    dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
+    dit->int8_mlp = !dit->prequantized_int8 && !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
+    dit->int8_qkv = !dit->prequantized_int8 && !dit->ssd_streaming && !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_attention_out = !dit->ssd_streaming &&
+    dit->int8_attention_out = !dit->prequantized_int8 && !dit->ssd_streaming &&
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
@@ -2293,7 +2511,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    if (dit->prequantized_int8) {
+        OP(h3_gpu_linear_i8_weight_bf16_square(
+            dit->gpu, dit->qkv, dit->mod_attention,
+            weight->qkv_int8, weight->qkv_scales, NULL,
+            rows, HIDDEN, INNER * 3),
+           "FastH3 input-major QKV projection");
+        OP(h3_gpu_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin,
+            rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "FastH3 QKV norm/RoPE");
+    } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -2312,13 +2541,30 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
+    if (dit->vsa_attention) {
+        OP(h3_gpu_linear_i8_weight_bf16_square(
+            dit->gpu, dit->attention_heads, dit->mod_attention,
+            weight->vsa_gate_int8, weight->vsa_gate_scales, NULL,
+            rows, HIDDEN, INNER),
+           "FastH3 learned VSA gate projection");
+    }
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int head_major_attention_output = int8_attention_output &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (head_major_attention_output)
+    if (dit->vsa_attention)
+        OP(h3_gpu_vsa_attention_bf16(
+            dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+            dit->attention_heads, dit->vsa_tiled_qkvg, dit->vsa_pooled_qkv,
+            dit->vsa_selected_video_tiles, dit->vsa_block_sizes,
+            dit->vsa_tiled_to_packed, rows, dit->vsa_geometry.padded_rows,
+            dit->vsa_geometry.tiles, dit->vsa_geometry.prefix_tiles,
+            dit->vsa_geometry.video_tiles, dit->vsa_topk, HEADS, HEAD_DIM,
+            1.0f / sqrtf((float)HEAD_DIM)),
+           "FastH3 learned VSA attention");
+    else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -2328,7 +2574,13 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
-    if (int8_attention_output) {
+    if (dit->prequantized_int8) {
+        OP(h3_gpu_linear_i8_weight_bf16_square(
+            dit->gpu, dit->attention_output, dit->attention_heads,
+            weight->out_int8, weight->out_scales, NULL,
+            rows, INNER, HIDDEN),
+           "FastH3 input-major attention output");
+    } else if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
                 dit->gpu, dit->attention_output, dit->int8_activation,
@@ -2377,7 +2629,19 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->int8_mlp &&
+    if (dit->prequantized_int8) {
+        OP(h3_gpu_linear_i8_weight_bf16_square(
+            dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1_int8,
+            weight->fc1_scales, NULL, rows, HIDDEN, FFN * 2),
+           "FastH3 input-major MLP input");
+        OP(h3_gpu_swiglu_bf16(
+            dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "FastH3 SwiGLU");
+        OP(h3_gpu_linear_i8_weight_bf16_square(
+            dit->gpu, mlp_output, dit->activated, weight->fc2_int8,
+            weight->fc2_scales, NULL, rows, FFN, HIDDEN),
+           "FastH3 input-major MLP output");
+    } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
@@ -3428,6 +3692,9 @@ void h3_dit_free(h3_dit *dit) {
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(attention_heads); FREE(attention_output);
+    FREE(vsa_block_sizes); FREE(vsa_tiled_to_packed);
+    FREE(vsa_tiled_qkvg); FREE(vsa_pooled_qkv);
+    FREE(vsa_selected_video_tiles);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);
@@ -3451,6 +3718,7 @@ void h3_dit_free(h3_dit *dit) {
                 dit->stream_wait_seconds);
     }
     h3_gpu_free(dit->gpu);
+    h3_vsa_geometry_free(&dit->vsa_geometry);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
     free(dit);

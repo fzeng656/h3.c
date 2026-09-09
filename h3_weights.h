@@ -26,6 +26,19 @@ h3_gpu_tensor *h3_weight_load_bf16(const h3_weight_store *store, h3_gpu *gpu,
                                    const char *name, int ndim,
                                    const uint64_t *shape,
                                    char *error, size_t error_size);
+h3_gpu_tensor *h3_weight_load_i8(const h3_weight_store *store, h3_gpu *gpu,
+                                 const char *name, int ndim,
+                                 const uint64_t *shape,
+                                 char *error, size_t error_size);
+int h3_weight_load_i8_linear_input_major(
+    const h3_weight_store *store, h3_gpu *gpu, const char *weight_name,
+    uint64_t input_columns, uint64_t output_rows, h3_gpu_tensor **weight,
+    h3_gpu_tensor **scales, char *error, size_t error_size);
+int h3_weight_i8_linear_convrot_group(const h3_weight_store *store,
+                                      const char *weight_name,
+                                      uint32_t *group_size,
+                                      char *error, size_t error_size);
+
 h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape,

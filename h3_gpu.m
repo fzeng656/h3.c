@@ -488,6 +488,7 @@ static h3_gpu *h3_gpu_create_internal(const char *shader_source_path,
                 @"h3_linear_int8_grouped_local_nax_r128x64"];
             [names addObject:
                 @"h3_linear_int8_grouped_local_nax_r128x128"];
+            [names addObject:@"h3_linear_i8_weight_bf16_simd_square"];
         }
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
@@ -3612,6 +3613,56 @@ int h3_gpu_linear_int8_grouped_bf16(h3_gpu *opaque,
                               (output_dim / 64u);
         [encoder dispatchThreadgroups:MTLSizeMake(dispatch, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_linear_i8_weight_bf16_square(
+    h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *weight_scales,
+    const h3_gpu_tensor *bias, uint32_t rows, uint32_t input_dim,
+    uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !rows || !input_dim || !output_dim ||
+        ![gpu.device supportsFamily:MTLGPUFamilyApple7]) {
+        if (gpu) h3_gpu_set_error(gpu, @"input-major INT8 linear requires Apple7+");
+        return 0;
+    }
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"input-major int8 linear input") ||
+        !h3_gpu_require_i8(gpu, weight, (size_t)input_dim * output_dim,
+                           @"input-major int8 linear weight") ||
+        !h3_gpu_require_f32(gpu, weight_scales, output_dim,
+                            @"input-major int8 linear scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"input-major int8 linear output") ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
+                                      @"input-major int8 linear bias")) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_i8_weight_bf16_simd_square");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32u) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch input-major int8 linear");
+        return 0;
+    }
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 39) / 40,
+                                                  (rows + 63) / 64, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;

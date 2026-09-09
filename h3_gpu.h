@@ -367,6 +367,12 @@ int h3_gpu_roundtrip_int8_grouped_bf16(h3_gpu *gpu,
                                 h3_gpu_tensor *scales,
                                 uint32_t rows, uint32_t columns,
                                 uint32_t group_size);
+int h3_gpu_linear_i8_weight_bf16_square(
+    h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+    const h3_gpu_tensor *weight, const h3_gpu_tensor *weight_scales,
+    const h3_gpu_tensor *bias, uint32_t rows, uint32_t input_dim,
+    uint32_t output_dim);
+
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,

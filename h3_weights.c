@@ -1,5 +1,6 @@
 #include "h3_weights.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -174,11 +175,16 @@ static h3_gpu_tensor *load_tensor(const h3_weight_store *store, h3_gpu *gpu,
         fail(error, error_size, "weight %s is too large for this process", name);
         return NULL;
     }
-    h3_gpu_tensor *result = dtype == H3_DTYPE_BF16 ?
-        h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
-                                (size_t)elements) :
-        h3_gpu_tensor_load_f32(gpu, header->path, tensor->file_offset,
-                               (size_t)elements);
+    h3_gpu_tensor *result = NULL;
+    if (dtype == H3_DTYPE_BF16)
+        result = h3_gpu_tensor_load_bf16(gpu, header->path, tensor->file_offset,
+                                         (size_t)elements);
+    else if (dtype == H3_DTYPE_I8)
+        result = h3_gpu_tensor_load_i8(gpu, header->path, tensor->file_offset,
+                                       (size_t)elements);
+    else if (dtype == H3_DTYPE_F32)
+        result = h3_gpu_tensor_load_f32(gpu, header->path, tensor->file_offset,
+                                        (size_t)elements);
     if (!result) {
         fail(error, error_size, "cannot load %s: %s", name, h3_gpu_error(gpu));
     }
@@ -193,10 +199,170 @@ h3_gpu_tensor *h3_weight_load_bf16(const h3_weight_store *store, h3_gpu *gpu,
                        error, error_size);
 }
 
+h3_gpu_tensor *h3_weight_load_i8(const h3_weight_store *store, h3_gpu *gpu,
+                                 const char *name, int ndim,
+                                 const uint64_t *shape,
+                                 char *error, size_t error_size) {
+    return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_I8,
+                       error, error_size);
+}
+
 h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape,
                                   char *error, size_t error_size) {
     return load_tensor(store, gpu, name, ndim, shape, H3_DTYPE_F32,
                        error, error_size);
+}
+
+static int load_i8_linear(const h3_weight_store *store, h3_gpu *gpu,
+                          const char *weight_name, uint64_t stored_rows,
+                          uint64_t stored_columns, uint64_t output_rows,
+                          h3_gpu_tensor **weight, h3_gpu_tensor **scales,
+                          char *error, size_t error_size) {
+    if (weight) *weight = NULL;
+    if (scales) *scales = NULL;
+    if (!store || !gpu || !weight_name || !*weight_name || !stored_rows ||
+        !stored_columns || !output_rows || !weight || !scales) {
+        fail(error, error_size, "invalid pre-quantized linear arguments");
+        return 0;
+    }
+    size_t name_size = strlen(weight_name) + sizeof("_scale");
+    char *scale_name = malloc(name_size);
+    if (!scale_name) {
+        fail(error, error_size, "out of memory resolving linear scales");
+        return 0;
+    }
+    snprintf(scale_name, name_size, "%s_scale", weight_name);
+    const h3_st_tensor *scale_tensor = h3_weight_find(store, scale_name, NULL);
+    if (!scale_tensor || scale_tensor->dtype != H3_DTYPE_F32 ||
+        !((scale_tensor->ndim == 1 && scale_tensor->shape[0] == output_rows) ||
+          (scale_tensor->ndim == 2 && scale_tensor->shape[0] == output_rows &&
+           scale_tensor->shape[1] == 1))) {
+        fail(error, error_size, "linear scale has the wrong schema: %s", scale_name);
+        free(scale_name);
+        return 0;
+    }
+    const uint64_t weight_shape[] = {stored_rows, stored_columns};
+    const uint64_t scale_shape_1d[] = {output_rows};
+    const uint64_t scale_shape_2d[] = {output_rows, 1};
+    h3_gpu_tensor *loaded_weight = h3_weight_load_i8(
+        store, gpu, weight_name, 2, weight_shape, error, error_size);
+    h3_gpu_tensor *loaded_scales = loaded_weight ? h3_weight_load_f32(
+        store, gpu, scale_name, scale_tensor->ndim,
+        scale_tensor->ndim == 1 ? scale_shape_1d : scale_shape_2d,
+        error, error_size) : NULL;
+    free(scale_name);
+    if (!loaded_weight || !loaded_scales) {
+        h3_gpu_tensor_free(loaded_weight);
+        h3_gpu_tensor_free(loaded_scales);
+        return 0;
+    }
+    *weight = loaded_weight;
+    *scales = loaded_scales;
+    return 1;
+}
+
+int h3_weight_load_i8_linear_input_major(
+    const h3_weight_store *store, h3_gpu *gpu, const char *weight_name,
+    uint64_t input_columns, uint64_t output_rows, h3_gpu_tensor **weight,
+    h3_gpu_tensor **scales, char *error, size_t error_size) {
+    return load_i8_linear(store, gpu, weight_name, input_columns, output_rows,
+                          output_rows, weight, scales, error, error_size);
+}
+
+static const char *json_value(const char *json, const char *key) {
+    const char *position = strstr(json, key);
+    if (!position) return NULL;
+    position = strchr(position + strlen(key), ':');
+    if (!position) return NULL;
+    position++;
+    while (*position && isspace((unsigned char)*position)) position++;
+    return position;
+}
+
+static int regular_hadamard_size(uint64_t size) {
+    if (size < 4) return 0;
+    while (size > 1 && size % 4 == 0) size /= 4;
+    return size == 1;
+}
+
+int h3_weight_i8_linear_convrot_group(const h3_weight_store *store,
+                                      const char *weight_name,
+                                      uint32_t *group_size,
+                                      char *error, size_t error_size) {
+    if (group_size) *group_size = 0;
+    if (!store || !weight_name || !*weight_name || !group_size) {
+        fail(error, error_size, "invalid quantization metadata arguments");
+        return 0;
+    }
+    static const char weight_suffix[] = ".weight";
+    size_t name_length = strlen(weight_name);
+    size_t suffix_length = sizeof(weight_suffix) - 1;
+    if (name_length <= suffix_length ||
+        strcmp(weight_name + name_length - suffix_length, weight_suffix) != 0) {
+        fail(error, error_size, "linear weight name does not end in .weight: %s",
+             weight_name);
+        return 0;
+    }
+    static const char marker_suffix[] = ".comfy_quant";
+    size_t marker_size = name_length - suffix_length + sizeof(marker_suffix);
+    char *marker_name = malloc(marker_size);
+    if (!marker_name) {
+        fail(error, error_size, "out of memory resolving quantization marker");
+        return 0;
+    }
+    memcpy(marker_name, weight_name, name_length - suffix_length);
+    memcpy(marker_name + name_length - suffix_length, marker_suffix,
+           sizeof(marker_suffix));
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, marker_name, &header);
+    if (!tensor) {
+        free(marker_name);
+        return 1;
+    }
+    uint64_t bytes = h3_st_tensor_elements(tensor);
+    if (!header || tensor->dtype != H3_DTYPE_U8 || tensor->ndim != 1 ||
+        !bytes || bytes > 511) {
+        fail(error, error_size, "quantization marker has the wrong schema: %s",
+             marker_name);
+        free(marker_name);
+        return 0;
+    }
+    char marker[512];
+    if (!h3_st_read_data(header, tensor, marker, (size_t)bytes,
+                         error, error_size)) {
+        free(marker_name);
+        return 0;
+    }
+    marker[bytes] = '\0';
+    if (!strstr(marker, "\"format\"") ||
+        !strstr(marker, "\"int8_tensorwise\"")) {
+        fail(error, error_size, "unsupported quantization format in %s",
+             marker_name);
+        free(marker_name);
+        return 0;
+    }
+    const char *convrot = json_value(marker, "\"convrot\"");
+    if (!convrot || !strncmp(convrot, "false", 5)) {
+        free(marker_name);
+        return 1;
+    }
+    if (strncmp(convrot, "true", 4) != 0) {
+        fail(error, error_size, "invalid ConvRot flag in %s", marker_name);
+        free(marker_name);
+        return 0;
+    }
+    const char *group = json_value(marker, "\"convrot_groupsize\"");
+    char *end = NULL;
+    uint64_t parsed = group ? strtoull(group, &end, 10) : 0;
+    if (!group || end == group || parsed > UINT32_MAX ||
+        !regular_hadamard_size(parsed)) {
+        fail(error, error_size, "invalid ConvRot group size in %s", marker_name);
+        free(marker_name);
+        return 0;
+    }
+    *group_size = (uint32_t)parsed;
+    free(marker_name);
+    return 1;
 }

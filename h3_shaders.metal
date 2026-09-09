@@ -4505,3 +4505,127 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+/* FastH3 input-major INT8 weight x BF16 activation. */
+kernel void h3_linear_i8_weight_bf16_simd_square(
+                           device const ushort *input [[buffer(0)]],
+                           device const char *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device const ushort *bias [[buffer(3)]],
+                           device ushort *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint TILE = 8;
+    /* 32 rows by 64 columns. Loads per k step are 2*(DOWN + ACROSS) elements a
+     * lane, the products DOWN*ACROSS*16, so a wider tile buys arithmetic per
+     * load: 21 against the square tile's 16. Wider still would be better again
+     * and does not fit — 64x64 wants 128 floats a lane of accumulator alone,
+     * which spills. */
+    constexpr uint DOWN = 8;
+    constexpr uint ACROSS = 5;
+    uint row_start = group.y * (TILE * DOWN);
+    uint column_start = group.x * (TILE * ACROSS);
+    ushort quad = lane / 4;
+    uint fragment_row = (quad & 4) + ((lane / 2) % 4);
+    uint fragment_column = (quad & 2) * 2 + (lane % 2) * 2;
+
+    simdgroup_matrix<float, TILE, TILE> a[DOWN];
+    simdgroup_matrix<float, TILE, TILE> b[ACROSS];
+    simdgroup_matrix<float, TILE, TILE> accumulator[DOWN * ACROSS];
+#pragma clang loop unroll(full)
+    for (uint index = 0; index < DOWN * ACROSS; index++) {
+        accumulator[index].thread_elements()[0] = 0.0f;
+        accumulator[index].thread_elements()[1] = 0.0f;
+    }
+
+    /* Whether this tile lies wholly inside the matrix is a property of the
+     * tile, not of any element, so ask once. The DiT's shapes make the
+     * interior case near-universal — 3840 and 10240 inputs, 3840 to 20480
+     * outputs, token counts that are multiples of 32 — and the edge path then
+     * costs only the handful of tiles that really do hang over. Asking per
+     * element instead put a pair of comparisons in front of all sixteen loads
+     * of every k step, which is the inner loop. */
+    const bool interior = row_start + TILE * DOWN <= args.rows &&
+                          column_start + TILE * ACROSS <= args.output_dim &&
+                          (args.input_dim % TILE) == 0;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        uint step_row = k + fragment_row;
+        uint step_column = k + fragment_column;
+        if (interior) {
+#pragma clang loop unroll(full)
+            for (uint down = 0; down < DOWN; down++) {
+                device const ushort *row =
+                    input + (row_start + down * TILE + fragment_row) *
+                            args.input_dim + step_column;
+                a[down].thread_elements()[0] = h3_bf16_to_f32(row[0]);
+                a[down].thread_elements()[1] = h3_bf16_to_f32(row[1]);
+            }
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++) {
+                device const char *row =
+                    weight + (size_t)step_row * args.output_dim +
+                             column_start + across * TILE + fragment_column;
+                b[across].thread_elements()[0] = float(row[0]);
+                b[across].thread_elements()[1] = float(row[1]);
+            }
+        } else {
+#pragma clang loop unroll(full)
+            for (uint down = 0; down < DOWN; down++) {
+                uint input_row = row_start + down * TILE + fragment_row;
+                a[down].thread_elements()[0] =
+                    input_row < args.rows && step_column < args.input_dim ?
+                    h3_bf16_to_f32(input[input_row * args.input_dim + step_column]) :
+                    0.0f;
+                a[down].thread_elements()[1] =
+                    input_row < args.rows && step_column + 1 < args.input_dim ?
+                    h3_bf16_to_f32(
+                        input[input_row * args.input_dim + step_column + 1]) : 0.0f;
+            }
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++) {
+                uint weight_column = column_start + across * TILE + fragment_column;
+                b[across].thread_elements()[0] =
+                    step_row < args.input_dim && weight_column < args.output_dim ?
+                    float(weight[(size_t)step_row * args.output_dim + weight_column]) : 0.0f;
+                b[across].thread_elements()[1] =
+                    step_row < args.input_dim && weight_column + 1 < args.output_dim ?
+                    float(weight[(size_t)step_row * args.output_dim + weight_column + 1]) :
+                    0.0f;
+            }
+        }
+#pragma clang loop unroll(full)
+        for (uint down = 0; down < DOWN; down++)
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++)
+                simdgroup_multiply_accumulate(accumulator[down * ACROSS + across],
+                                              a[down], b[across],
+                                              accumulator[down * ACROSS + across]);
+    }
+
+#pragma clang loop unroll(full)
+    for (uint down = 0; down < DOWN; down++) {
+        uint output_row = row_start + down * TILE + fragment_row;
+        if (output_row >= args.rows) continue;
+#pragma clang loop unroll(full)
+        for (uint across = 0; across < ACROSS; across++) {
+            uint output_column = column_start + across * TILE + fragment_column;
+            uint slot = down * ACROSS + across;
+            if (output_column < args.output_dim) {
+                float value = accumulator[slot].thread_elements()[0] *
+                    weight_scales[output_column];
+                if (args.has_bias) value += h3_bf16_to_f32(bias[output_column]);
+                output[output_row * args.output_dim + output_column] =
+                    h3_f32_to_bf16(value);
+            }
+            if (output_column + 1 < args.output_dim) {
+                float value = accumulator[slot].thread_elements()[1] *
+                    weight_scales[output_column + 1];
+                if (args.has_bias)
+                    value += h3_bf16_to_f32(bias[output_column + 1]);
+                output[output_row * args.output_dim + output_column + 1] =
+                    h3_f32_to_bf16(value);
+            }
+        }
+    }
+}
