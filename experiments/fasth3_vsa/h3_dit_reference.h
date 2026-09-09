@@ -1,0 +1,235 @@
+#ifndef H3_DIT_H
+#define H3_DIT_H
+
+#include "h3_gpu.h"
+#include "h3_host.h"
+#include "h3_text_encoder.h"
+
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct h3_dit h3_dit;
+
+/* Exact VSA-H3 tile-64 geometry. Prefix segments are chunked independently,
+ * then the generated-video tail is packed in 4x4x4 (time, height, width)
+ * tiles. `packed_to_tiled` and `tiled_to_packed` are inverse on valid rows;
+ * padded slots in the latter are UINT32_MAX. */
+typedef struct {
+    uint32_t sequence;
+    uint32_t padded_rows;
+    uint32_t tiles;
+    uint32_t prefix_tiles;
+    uint32_t video_tiles;
+    uint32_t *packed_to_tiled;
+    uint32_t *tiled_to_packed;
+    uint32_t *block_sizes;
+} h3_vsa_geometry;
+
+int h3_vsa_geometry_build(const uint32_t *prefix_segments,
+                          size_t prefix_segment_count,
+                          uint32_t video_t, uint32_t video_h,
+                          uint32_t video_w, h3_vsa_geometry *geometry,
+                          char *error, size_t error_size);
+void h3_vsa_geometry_free(h3_vsa_geometry *geometry);
+
+/* Optional target rows that are partly supplied by source media. A generate
+ * mask value of one follows the normal denoising schedule; zero pins the row
+ * to clean conditioning and writes the encoded source back after every step.
+ * Video source layout is [24,T,H,W], audio [32,2,T]. */
+typedef struct {
+    const float *video_source;
+    size_t video_source_elements;
+    const uint8_t *video_generate_rows;
+    size_t video_generate_count;
+    const float *audio_source;
+    size_t audio_source_elements;
+    const uint8_t *audio_generate_rows;
+    size_t audio_generate_count;
+} h3_dit_inpaint;
+
+typedef void (*h3_dit_progress)(const char *phase, int completed, int total,
+                                void *opaque);
+
+typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
+                              const float *video_latent,
+                              size_t video_elements, void *opaque);
+
+typedef struct {
+    int next_step;
+    int last_evaluated;
+    int previous_evaluated;
+    const float *last_video_velocity;
+    const float *last_audio_velocity;
+    const float *previous_video_velocity;
+    const float *previous_audio_velocity;
+} h3_dit_euler_resume;
+
+typedef struct {
+    int total_steps;
+    int next_step;
+    int last_evaluated;
+    int previous_evaluated;
+    size_t video_count;
+    size_t audio_count;
+    const float *video;
+    const float *audio;
+    const float *last_video_velocity;
+    const float *last_audio_velocity;
+    const float *previous_video_velocity;
+    const float *previous_audio_velocity;
+} h3_dit_euler_checkpoint_state;
+
+typedef int (*h3_dit_checkpoint)(
+    const h3_dit_euler_checkpoint_state *state, void *opaque);
+
+/* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
+ * happen before the persistent core is loaded. SSD streaming retains only the
+ * small block norms and two alternating matrix slots (BF16, or I8 plus F32
+ * scales for a pre-quantized checkpoint). */
+h3_dit *h3_dit_load_t2va(const char *weight_directory,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
+                         unsigned core_reuse_interval,
+                         int token_reduction,
+                         int ssd_streaming,
+                         float spatial_rope_scale,
+                         int use_slower_bf16_mlp,
+                         int use_slower_bf16_qkv,
+                         int use_slower_bf16_attention_output,
+                         int use_slower_row_major_attention_output,
+                         int use_slower_unfused_int8_inputs,
+                         int use_slower_unfused_qkv_rope,
+                         int use_slower_scalar_qkv_rms,
+                         int use_slower_uncached_int8_scales,
+                         int use_slower_dynamic_fc1_k,
+                         int use_slower_grouped_quantizer,
+                         int use_int8_row_fc2,
+                         const char *lora_path,
+                         float lora_strength,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
+
+/* Load FL2VA/Ref2VA packing. adaln_overlay_path may point at the validated
+ * compact Ref2VA blocks-25-through-49 overlay while weight_directory remains
+ * the FL2VA base. Condition inputs are already patchified F32 row sources:
+ * visual rows have width 96 and audio rows width 32. Their element counts must
+ * exactly match layout.img_cond_rows/audio_cond_rows. */
+/* Enables TE-Speed style block caching: gated denoising steps run only a
+ * warm prefix of the transformer blocks and replay the cached tail residual.
+ * Call after load; refuses core reuse and token reduction combinations. */
+int h3_dit_set_block_cache(h3_dit *dit, int enabled,
+                           char *error, size_t error_size);
+
+h3_dit *h3_dit_load_conditioned(
+                         const char *weight_directory,
+                         const char *adaln_overlay_path,
+                         const char *shader_source_path,
+                         const h3_text_embedding *text,
+                         const h3_layout *layout,
+                         const h3_sigma_schedule *sigmas,
+                         unsigned active_blocks,
+                         unsigned core_reuse_interval,
+                         int token_reduction,
+                         int ssd_streaming,
+                         float spatial_rope_scale,
+                         int use_slower_bf16_mlp,
+                         int use_slower_bf16_qkv,
+                         int use_slower_bf16_attention_output,
+                         int use_slower_row_major_attention_output,
+                         int use_slower_unfused_int8_inputs,
+                         int use_slower_unfused_qkv_rope,
+                         int use_slower_scalar_qkv_rms,
+                         int use_slower_uncached_int8_scales,
+                         int use_slower_dynamic_fc1_k,
+                         int use_slower_grouped_quantizer,
+                         int use_int8_row_fc2,
+                         const char *lora_path,
+                         float lora_strength,
+                         const float *condition_video_rows,
+                         size_t condition_video_elements,
+                         const float *condition_audio_rows,
+                         size_t condition_audio_elements,
+                         const h3_dit_inpaint *inpaint,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
+void h3_dit_free(h3_dit *dit);
+
+/* Reset mutable sampler state and replace seed-dependent condition rows before
+ * reusing an otherwise identical prepared transformer. */
+int h3_dit_reset_run(h3_dit *dit,
+                     const float *condition_video_rows,
+                     size_t condition_video_elements,
+                     const float *condition_audio_rows,
+                     size_t condition_audio_elements,
+                     char *error, size_t error_size);
+
+size_t h3_dit_video_elements(const h3_dit *dit);
+size_t h3_dit_audio_elements(const h3_dit *dit);
+
+/* One raw data-ward velocity evaluation. Input/output video layout is
+ * [24,T,H,W], audio is [32,2,T], all F32 on the host boundary. */
+int h3_dit_forward(h3_dit *dit, int step,
+                   const float *video_latent, const float *audio_latent,
+                   float *video_velocity, float *audio_velocity,
+                   char *error, size_t error_size);
+
+/* Run every configured RES multistep update in place. Solver state remains
+ * F32 between transformer evaluations, matching the released MLX path. */
+int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
+                   h3_dit_progress progress, void *progress_opaque,
+                   char *error, size_t error_size);
+
+/* Current serving sampler: independent video/audio shifted Euler grids. */
+int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
+                         float *audio_latent, int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         char *error, size_t error_size);
+
+/* Preview variant. The callback runs after every Euler transition with the
+ * current channel-major F32 video latent. It is deliberately opt-in because it
+ * introduces a synchronization point after each step. */
+int h3_dit_denoise_euler_preview(
+                         h3_dit *dit, float *video_latent,
+                         float *audio_latent, int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         h3_dit_preview preview, void *preview_opaque,
+                         char *error, size_t error_size);
+
+/* Crash-recovery variant. `resume` restores a completed Euler boundary and
+ * `checkpoint` observes later completed boundaries. The ordinary API above
+ * remains the zero-state wrapper. */
+int h3_dit_denoise_euler_resume(
+                         h3_dit *dit, float *video_latent,
+                         float *audio_latent, int reuse_interval,
+                         const h3_dit_euler_resume *resume,
+                         h3_dit_checkpoint checkpoint,
+                         void *checkpoint_opaque,
+                         h3_dit_progress progress, void *progress_opaque,
+                         h3_dit_preview preview, void *preview_opaque,
+                         char *error, size_t error_size);
+
+/* Build the velocity-evaluation mask used by the serving sampler. Returns the
+ * evaluation count, or -1 for invalid arguments. Public internally so the
+ * quality-tuned aggressive schedule remains pinned by cheap host tests. */
+int h3_dit_reuse_schedule(int steps, int reuse_interval, uint8_t *selected,
+                          size_t selected_count);
+
+int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats);
+
+/* Exact row-order conversions, public internally so they can be pinned by
+ * cheap tests independently of the 62 GiB checkpoint. */
+int h3_dit_patchify_video(const float *latent, int channels, int time,
+                          int height, int width, float *rows,
+                          size_t row_elements);
+int h3_dit_unpatchify_video(const float *rows, int channels, int time,
+                            int height, int width, float *latent,
+                            size_t latent_elements);
+int h3_dit_pack_audio(const float *latent, int channels, int time,
+                      float *rows, size_t row_elements);
+int h3_dit_unpack_audio(const float *rows, int channels, int time,
+                        float *latent, size_t latent_elements);
+
+#endif
