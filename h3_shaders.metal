@@ -49,6 +49,8 @@ struct linear_args {
     uint has_bias;
 };
 
+struct convrot_args { uint rows; uint width; uint group_size; };
+
 struct int8_quant_args {
     uint rows;
     uint columns;
@@ -4628,4 +4630,42 @@ kernel void h3_linear_i8_weight_bf16_simd_square(
             }
         }
     }
+}
+
+kernel void h3_convrot_bf16(device const ushort *input [[buffer(0)]],
+                            device ushort *output [[buffer(1)]],
+                            constant convrot_args &args [[buffer(2)]],
+                            ushort tid [[thread_index_in_threadgroup]],
+                            uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float first[256];
+    threadgroup float second[256];
+    uint row = group.y;
+    uint feature_group = group.x;
+    if (row >= args.rows || args.group_size != 256) return;
+    uint offset = row * args.width + feature_group * 256;
+    first[tid] = h3_bf16_to_f32(input[offset + tid]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stage = 0, stride = 1; stage < 4; stage++, stride *= 4) {
+        uint digit = (uint(tid) / stride) & 3u;
+        uint base = uint(tid) - digit * stride;
+        float a, b, c, d;
+        if ((stage & 1u) == 0) {
+            a = first[base];
+            b = first[base + stride];
+            c = first[base + stride * 2];
+            d = first[base + stride * 3];
+        } else {
+            a = second[base];
+            b = second[base + stride];
+            c = second[base + stride * 2];
+            d = second[base + stride * 3];
+        }
+        float value = digit == 0 ? a + b + c - d :
+                      digit == 1 ? a + b - c + d :
+                      digit == 2 ? a - b + c + d : -a + b + c + d;
+        if ((stage & 1u) == 0) second[tid] = value;
+        else first[tid] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    output[offset + tid] = h3_f32_to_bf16(first[tid] * 0.0625f);
 }

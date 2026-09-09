@@ -40,19 +40,24 @@ typedef struct {
     h3_gpu_tensor *qkv;
     h3_gpu_tensor *qkv_int8;
     h3_gpu_tensor *qkv_scales;
+    uint32_t qkv_convrot_group;
     h3_gpu_tensor *vsa_gate_int8;
     h3_gpu_tensor *vsa_gate_scales;
+    uint32_t vsa_gate_convrot_group;
     h3_gpu_tensor *q_norm;
     h3_gpu_tensor *k_norm;
     h3_gpu_tensor *out;
     h3_gpu_tensor *out_int8;
     h3_gpu_tensor *out_scales;
+    uint32_t out_convrot_group;
     h3_gpu_tensor *fc1;
     h3_gpu_tensor *fc2;
     h3_gpu_tensor *fc1_int8;
     h3_gpu_tensor *fc1_scales;
+    uint32_t fc1_convrot_group;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    uint32_t fc2_convrot_group;
 } h3_dit_block;
 
 enum {
@@ -864,27 +869,30 @@ static int load_prequantized_block(h3_dit *dit, h3_dit_block *block,
                                    char *error, size_t error_size) {
     char name[160];
     if (!load_block_norms(dit, block, prefix, error, error_size)) return 0;
-#define LOAD_IM(weight_field, scale_field, suffix, input_dim, output_dim) do { \
+#define LOAD_IM(weight_field, scale_field, group_field, suffix, input_dim, output_dim) do { \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                      \
     if (!h3_weight_load_i8_linear_input_major(                                  \
             dit->weights, dit->gpu, name, input_dim, output_dim,                \
             &block->weight_field, &block->scale_field, error, error_size))      \
         return 0;                                                                \
-    uint32_t convrot_group = 0;                                                  \
     if (!h3_weight_i8_linear_convrot_group(                                      \
-            dit->weights, name, &convrot_group, error, error_size)) return 0;   \
-    if (convrot_group) {                                                         \
-        fail(error, error_size,                                                  \
-             "FastH3 v2 ConvRot group %u is not wired in this runtime yet: %s",\
-             convrot_group, name);                                               \
+            dit->weights, name, &block->group_field, error, error_size))        \
         return 0;                                                                \
-    }                                                                            \
 } while (0)
-    LOAD_IM(qkv_int8, qkv_scales, "attn.qkv_proj.weight", HIDDEN, INNER * 3);
-    LOAD_IM(vsa_gate_int8, vsa_gate_scales, "attn.vsa_gate.weight", HIDDEN, INNER);
-    LOAD_IM(out_int8, out_scales, "attn.out_proj.weight", INNER, HIDDEN);
-    LOAD_IM(fc1_int8, fc1_scales, "mlp.fc1.weight", HIDDEN, FFN * 2);
-    LOAD_IM(fc2_int8, fc2_scales, "mlp.fc2.weight", FFN, HIDDEN);
+    LOAD_IM(qkv_int8, qkv_scales, qkv_convrot_group,
+            "attn.qkv_proj.weight", HIDDEN, INNER * 3);
+    LOAD_IM(vsa_gate_int8, vsa_gate_scales, vsa_gate_convrot_group,
+            "attn.vsa_gate.weight", HIDDEN, INNER);
+    if (block->vsa_gate_convrot_group != block->qkv_convrot_group) {
+        fail(error, error_size, "FastH3 VSA gate and QKV ConvRot groups differ");
+        return 0;
+    }
+    LOAD_IM(out_int8, out_scales, out_convrot_group,
+            "attn.out_proj.weight", INNER, HIDDEN);
+    LOAD_IM(fc1_int8, fc1_scales, fc1_convrot_group,
+            "mlp.fc1.weight", HIDDEN, FFN * 2);
+    LOAD_IM(fc2_int8, fc2_scales, fc2_convrot_group,
+            "mlp.fc2.weight", FFN, HIDDEN);
 #undef LOAD_IM
     return 1;
 }
@@ -2512,6 +2520,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
     if (dit->prequantized_int8) {
+        if (weight->qkv_convrot_group)
+            OP(h3_gpu_convrot_bf16(dit->gpu, dit->mod_attention,
+                                    dit->mod_attention, rows, HIDDEN,
+                                    weight->qkv_convrot_group),
+               "FastH3 QKV/gate ConvRot");
         OP(h3_gpu_linear_i8_weight_bf16_square(
             dit->gpu, dit->qkv, dit->mod_attention,
             weight->qkv_int8, weight->qkv_scales, NULL,
@@ -2575,6 +2588,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
     if (dit->prequantized_int8) {
+        if (weight->out_convrot_group)
+            OP(h3_gpu_convrot_bf16(dit->gpu, dit->attention_heads,
+                                    dit->attention_heads, rows, INNER,
+                                    weight->out_convrot_group),
+               "FastH3 attention-output ConvRot");
         OP(h3_gpu_linear_i8_weight_bf16_square(
             dit->gpu, dit->attention_output, dit->attention_heads,
             weight->out_int8, weight->out_scales, NULL,
@@ -2630,6 +2648,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
     if (dit->prequantized_int8) {
+        if (weight->fc1_convrot_group)
+            OP(h3_gpu_convrot_bf16(dit->gpu, dit->mod_mlp, dit->mod_mlp,
+                                    rows, HIDDEN, weight->fc1_convrot_group),
+               "FastH3 FC1 ConvRot");
         OP(h3_gpu_linear_i8_weight_bf16_square(
             dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1_int8,
             weight->fc1_scales, NULL, rows, HIDDEN, FFN * 2),
@@ -2637,6 +2659,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_swiglu_bf16(
             dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "FastH3 SwiGLU");
+        if (weight->fc2_convrot_group)
+            OP(h3_gpu_convrot_bf16(dit->gpu, dit->activated, dit->activated,
+                                    rows, FFN, weight->fc2_convrot_group),
+               "FastH3 FC2 ConvRot");
         OP(h3_gpu_linear_i8_weight_bf16_square(
             dit->gpu, mlp_output, dit->activated, weight->fc2_int8,
             weight->fc2_scales, NULL, rows, FFN, HIDDEN),
