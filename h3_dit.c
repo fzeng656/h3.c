@@ -2515,10 +2515,39 @@ static int run_block(h3_dit *dit, unsigned index, int step,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
+    int fast_profile = dit->vsa_attention && dit->prequantized_int8 &&
+        index == 0 && step == 0 && getenv("H3_PROFILE_FASTH3_STAGES");
+    h3_gpu_stats fast_profile_last = {0};
+    if (fast_profile && !h3_gpu_get_stats(dit->gpu, &fast_profile_last)) {
+        fail(error, error_size, "cannot read FastH3 stage profile baseline");
+        return 0;
+    }
+#define PROFILE_FENCE(label) do {                                               \
+    if (fast_profile) {                                                         \
+        double _wall_started = stream_now();                                    \
+        OP(h3_gpu_submit(dit->gpu), "submit FastH3 stage profile");            \
+        h3_gpu_stats _profile_now = {0};                                        \
+        if (!h3_gpu_get_stats(dit->gpu, &_profile_now)) {                       \
+            fail(error, error_size, "cannot read FastH3 stage profile");      \
+            return 0;                                                           \
+        }                                                                       \
+        fprintf(stderr,                                                         \
+                "h3 fastprofile: %-28s gpu=%9.3fms wall=%9.3fms direct=%llu\n", \
+                (label),                                                        \
+                (_profile_now.gpu_seconds - fast_profile_last.gpu_seconds) *    \
+                    1000.0,                                                     \
+                (stream_now() - _wall_started) * 1000.0,                       \
+                (unsigned long long)(_profile_now.direct_dispatches -          \
+                                     fast_profile_last.direct_dispatches));     \
+        fast_profile_last = _profile_now;                                       \
+        OP(h3_gpu_begin(dit->gpu), "continue FastH3 stage profile");           \
+    }                                                                           \
+} while (0)
     if (!attention_adaln_ready)
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
+    PROFILE_FENCE("prefix + block0 attention AdaLN");
     if (dit->prequantized_int8) {
         if (weight->qkv_convrot_group)
             OP(h3_gpu_convrot_bf16(dit->gpu, dit->mod_attention,
@@ -2554,6 +2583,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
+    PROFILE_FENCE("QKV projection + norm/RoPE");
     if (dit->vsa_attention) {
         OP(h3_gpu_linear_i8_weight_bf16_square(
             dit->gpu, dit->attention_heads, dit->mod_attention,
@@ -2561,6 +2591,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rows, HIDDEN, INNER),
            "FastH3 learned VSA gate projection");
     }
+    PROFILE_FENCE("learned VSA gate projection");
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int head_major_attention_output = int8_attention_output &&
@@ -2587,6 +2618,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
+    PROFILE_FENCE("VSA attention");
     if (dit->prequantized_int8) {
         if (weight->out_convrot_group)
             OP(h3_gpu_convrot_bf16(dit->gpu, dit->attention_heads,
@@ -2617,6 +2649,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
     }
+    PROFILE_FENCE("attention output projection");
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
         !getenv("H3_DISABLE_FUSED_INT8_MLP_INPUT") &&
@@ -2645,6 +2678,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             modulation, row_map, rows, HIDDEN, SLOTS, 3, 4, 1e-5f),
            "DiT MLP AdaLN");
     }
+    PROFILE_FENCE("attention gate + MLP AdaLN");
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
     if (dit->prequantized_int8) {
@@ -2656,6 +2690,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1_int8,
             weight->fc1_scales, NULL, rows, HIDDEN, FFN * 2),
            "FastH3 input-major MLP input");
+        PROFILE_FENCE("MLP FC1 projection");
         OP(h3_gpu_swiglu_bf16(
             dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "FastH3 SwiGLU");
@@ -2663,10 +2698,12 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             OP(h3_gpu_convrot_bf16(dit->gpu, dit->activated, dit->activated,
                                     rows, FFN, weight->fc2_convrot_group),
                "FastH3 FC2 ConvRot");
+        PROFILE_FENCE("SwiGLU + FC2 ConvRot");
         OP(h3_gpu_linear_i8_weight_bf16_square(
             dit->gpu, mlp_output, dit->activated, weight->fc2_int8,
             weight->fc2_scales, NULL, rows, FFN, HIDDEN),
            "FastH3 input-major MLP output");
+        PROFILE_FENCE("MLP FC2 projection");
     } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
@@ -2728,6 +2765,12 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->hidden, dit->hidden, mlp_output,
             modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
     }
+    PROFILE_FENCE("MLP gate + next attention AdaLN");
+    if (fast_profile && getenv("H3_PROFILE_FASTH3_STOP_AFTER_BLOCK0")) {
+        fail(error, error_size, "FastH3 stage profile complete after block 0");
+        return 0;
+    }
+#undef PROFILE_FENCE
 #undef OP
     return 1;
 }

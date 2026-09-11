@@ -2792,6 +2792,25 @@ int h3_gpu_vsa_attention_bf16(
         heads, head_dim, scale
     };
     NSUInteger compressed_offset = summary_count * 3u * sizeof(float);
+    BOOL profile_vsa = getenv("H3_PROFILE_VSA_STAGES") != NULL;
+    double profile_gpu_last = gpu.stats.gpu_seconds;
+#define VSA_SPLIT_OR_BARRIER(stage_label) do {                                  \
+    if (profile_vsa) {                                                          \
+        [encoder endEncoding];                                                  \
+        double _wall_started = h3_gpu_now();                                    \
+        if (!h3_gpu_submit(opaque)) return 0;                                   \
+        double _gpu_now = gpu.stats.gpu_seconds;                                \
+        fprintf(stderr,                                                         \
+                "h3 vsa-profile: %-18s gpu=%9.3fms wall=%9.3fms\n",          \
+                (stage_label), (_gpu_now - profile_gpu_last) * 1000.0,          \
+                (h3_gpu_now() - _wall_started) * 1000.0);                       \
+        profile_gpu_last = _gpu_now;                                            \
+        if (!h3_gpu_begin(opaque)) return 0;                                    \
+        encoder = [gpu.command computeCommandEncoder];                          \
+    } else {                                                                    \
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];                \
+    }                                                                           \
+} while (0)
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -2805,7 +2824,7 @@ int h3_gpu_vsa_attention_bf16(
         [encoder setBytes:&args length:sizeof(args) atIndex:6];
         [encoder dispatchThreads:MTLSizeMake(tiled_section * 4u, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        VSA_SPLIT_OR_BARRIER("pack QKVG");
 
         [encoder setComputePipelineState:pool];
         [encoder setBuffer:TENSOR(tiled_qkvg).buffer offset:0 atIndex:0];
@@ -2814,7 +2833,7 @@ int h3_gpu_vsa_attention_bf16(
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        VSA_SPLIT_OR_BARRIER("pool QKV");
 
         [encoder setComputePipelineState:route];
         [encoder setBuffer:TENSOR(pooled_qkv).buffer offset:0 atIndex:0];
@@ -2826,7 +2845,7 @@ int h3_gpu_vsa_attention_bf16(
         [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        VSA_SPLIT_OR_BARRIER("route + top-k");
 
         [encoder setComputePipelineState:attention];
         [encoder setBuffer:TENSOR(tiled_qkvg).buffer offset:0 atIndex:0];
@@ -2840,8 +2859,23 @@ int h3_gpu_vsa_attention_bf16(
         [encoder setBytes:&args length:sizeof(args) atIndex:6];
         [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [encoder endEncoding];
+        if (profile_vsa) {
+            [encoder endEncoding];
+            double wall_started = h3_gpu_now();
+            if (!h3_gpu_submit(opaque)) return 0;
+            double gpu_now = gpu.stats.gpu_seconds;
+            fprintf(stderr,
+                    "h3 vsa-profile: %-18s gpu=%9.3fms wall=%9.3fms\n",
+                    "sparse attn+corr",
+                    (gpu_now - profile_gpu_last) * 1000.0,
+                    (h3_gpu_now() - wall_started) * 1000.0);
+            profile_gpu_last = gpu_now;
+            if (!h3_gpu_begin(opaque)) return 0;
+        } else {
+            [encoder endEncoding];
+        }
     }
+#undef VSA_SPLIT_OR_BARRIER
     h3_gpu_stats stats = gpu.stats;
     stats.direct_dispatches += 4;
     gpu.stats = stats;
