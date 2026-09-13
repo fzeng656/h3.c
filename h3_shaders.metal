@@ -3039,6 +3039,53 @@ kernel void h3_linear_int8_grouped_local_nax_r128x128(
         }
     }
 }
+
+/* FastH3 exact-semantics M5 TensorOps path: BF16 activations multiply the
+ * existing input-major INT8 checkpoint weights directly.  Accumulation stays
+ * FP32 and the original per-output weight scale is applied only once at the
+ * end, matching the scalar/simdgroup path's quantization contract. */
+kernel void h3_linear_i8_weight_bf16_nax_r128x64(
+                           device bfloat *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device bfloat *bias [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]]) {
+    constexpr int ROW_TILE = 128;
+    constexpr int COLUMN_TILE = 64;
+    uint row_tiles = (args.rows + ROW_TILE - 1) / ROW_TILE;
+    uint column_tiles = (args.output_dim + COLUMN_TILE - 1) / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.output_dim,
+                                     (int)args.input_dim));
+    auto mx = x.slice(0, (int)row_start);
+    auto mw = w.slice((int)column_start, 0);
+    matmul2d<matmul2d_descriptor(ROW_TILE, COLUMN_TILE, dynamic_extent,
+                                false, false, false),
+              execution_simdgroups<4>> mm;
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(x), decltype(w), float>();
+    mm.run(mx, mw, accum);
+
+    #pragma clang loop unroll(full)
+    for (ushort element = 0; element < accum.get_capacity(); element++) {
+        if (!accum.is_valid_element(element)) continue;
+        auto index = accum.get_multidimensional_index(element);
+        uint row = row_start + (uint)index[1];
+        uint column = column_start + (uint)index[0];
+        if (row >= args.rows || column >= args.output_dim) continue;
+        float value = (float)accum[element] * weight_scales[column];
+        if (args.has_bias) value += (float)bias[column];
+        output[row * args.output_dim + column] = (bfloat)value;
+    }
+}
 #endif
 
 kernel void h3_silu_bf16(device const ushort *input [[buffer(0)]],

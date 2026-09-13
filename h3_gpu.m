@@ -489,6 +489,7 @@ static h3_gpu *h3_gpu_create_internal(const char *shader_source_path,
             [names addObject:
                 @"h3_linear_int8_grouped_local_nax_r128x128"];
             [names addObject:@"h3_linear_i8_weight_bf16_simd_square"];
+            [names addObject:@"h3_linear_i8_weight_bf16_nax_r128x64"];
         }
         NSMutableDictionary *pipelines = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
@@ -3717,9 +3718,13 @@ int h3_gpu_linear_i8_weight_bf16_square(
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
                                       @"input-major int8 linear bias")) ||
         !h3_gpu_require_command(gpu)) return 0;
+    BOOL mixed_nax = gpu.tensorOpsEnabled &&
+        getenv("H3_FASTH3_MIXED_NAX") != NULL;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, @"h3_linear_i8_weight_bf16_simd_square");
-    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32u) {
+        gpu, mixed_nax ? @"h3_linear_i8_weight_bf16_nax_r128x64"
+                       : @"h3_linear_i8_weight_bf16_simd_square");
+    NSUInteger threads = mixed_nax ? 128u : 32u;
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < threads) {
         h3_gpu_set_error(gpu, @"device cannot dispatch input-major int8 linear");
         return 0;
     }
@@ -3734,9 +3739,16 @@ int h3_gpu_linear_i8_weight_bf16_square(
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
-        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 39) / 40,
-                                                  (rows + 63) / 64, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        if (mixed_nax) {
+            NSUInteger row_tiles = (rows + 127u) / 128u;
+            NSUInteger column_tiles = (output_dim + 63u) / 64u;
+            [encoder dispatchThreadgroups:MTLSizeMake(row_tiles * column_tiles, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 39) / 40,
+                                                      (rows + 63) / 64, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
         [encoder endEncoding];
     }
     h3_gpu_stats stats = gpu.stats;
