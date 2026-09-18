@@ -521,9 +521,12 @@ static h3_gpu *h3_gpu_create_internal(const char *shader_source_path,
                 [gpu.device newLibraryWithSource:sparseSource options:sparseOptions error:&sparseError] : nil;
             NSArray<NSString *> *sparseNames = @[
                 @"h3_vsa_pack_qkvg_bf16",
+                @"h3_vsa_pack_qkvg_headmajor_bf16",
                 @"h3_vsa_pool_qkv_bf16_d128",
+                @"h3_vsa_pool_qkv_headmajor_bf16_d128",
                 @"h3_vsa_route_compress_f32_d128",
-                @"h3_vsa_attn_tiled_bf16_d128_bq64"
+                @"h3_vsa_attn_tiled_bf16_d128_bq64",
+                @"h3_vsa_attn_headmajor_bf16_d128_bq64"
             ];
             if (!sparseLibrary) {
                 if (error && error_size) {
@@ -2767,14 +2770,29 @@ int h3_gpu_vsa_attention_bf16(
                             @"VSA tiled row map") ||
         !h3_gpu_require_command(gpu)) return 0;
 
+    const char *vsa_executor = getenv("H3_FASTH3_VSA_EXECUTOR");
+    BOOL use_headmajor =
+        vsa_executor && !strcmp(vsa_executor, "headmajor_steel");
     id<MTLComputePipelineState> pack = h3_gpu_pipeline(
-        gpu, @"h3_vsa_pack_qkvg_bf16");
+        gpu, use_headmajor
+            ? @"h3_vsa_pack_qkvg_headmajor_bf16"
+            : @"h3_vsa_pack_qkvg_bf16");
     id<MTLComputePipelineState> pool = h3_gpu_pipeline(
-        gpu, @"h3_vsa_pool_qkv_bf16_d128");
+        gpu, use_headmajor
+            ? @"h3_vsa_pool_qkv_headmajor_bf16_d128"
+            : @"h3_vsa_pool_qkv_bf16_d128");
     id<MTLComputePipelineState> route = h3_gpu_pipeline(
         gpu, @"h3_vsa_route_compress_f32_d128");
     id<MTLComputePipelineState> attention = h3_gpu_pipeline(
-        gpu, @"h3_vsa_attn_tiled_bf16_d128_bq64");
+        gpu, use_headmajor
+            ? @"h3_vsa_attn_headmajor_bf16_d128_bq64"
+            : @"h3_vsa_attn_tiled_bf16_d128_bq64");
+    const char *pack_label =
+        use_headmajor ? "pack QKVG[hm]" : "pack QKVG";
+    const char *pool_label =
+        use_headmajor ? "pool QKV[hm]" : "pool QKV";
+    const char *attention_label =
+        use_headmajor ? "sparse attn+corr[hm]" : "sparse attn+corr";
     NSUInteger score_bytes = (NSUInteger)tiles * sizeof(float);
     if (!pack || !pool || !route || !attention ||
         pool.maxTotalThreadsPerThreadgroup < 128 ||
@@ -2825,7 +2843,7 @@ int h3_gpu_vsa_attention_bf16(
         [encoder setBytes:&args length:sizeof(args) atIndex:6];
         [encoder dispatchThreads:MTLSizeMake(tiled_section * 4u, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        VSA_SPLIT_OR_BARRIER("pack QKVG");
+        VSA_SPLIT_OR_BARRIER(pack_label);
 
         [encoder setComputePipelineState:pool];
         [encoder setBuffer:TENSOR(tiled_qkvg).buffer offset:0 atIndex:0];
@@ -2834,7 +2852,7 @@ int h3_gpu_vsa_attention_bf16(
         [encoder setBytes:&args length:sizeof(args) atIndex:3];
         [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        VSA_SPLIT_OR_BARRIER("pool QKV");
+        VSA_SPLIT_OR_BARRIER(pool_label);
 
         [encoder setComputePipelineState:route];
         [encoder setBuffer:TENSOR(pooled_qkv).buffer offset:0 atIndex:0];
@@ -2867,7 +2885,7 @@ int h3_gpu_vsa_attention_bf16(
             double gpu_now = gpu.stats.gpu_seconds;
             fprintf(stderr,
                     "h3 vsa-profile: %-18s gpu=%9.3fms wall=%9.3fms\n",
-                    "sparse attn+corr",
+                    attention_label,
                     (gpu_now - profile_gpu_last) * 1000.0,
                     (h3_gpu_now() - wall_started) * 1000.0);
             profile_gpu_last = gpu_now;

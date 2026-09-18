@@ -1132,6 +1132,45 @@ kernel void h3_vsa_pack_qkvg_bf16(
   tiled[position] = result;
 }
 
+
+/* Head-major tiled Q/K/V/G layout:
+ *   [section][head][tiled_row][head_dim]
+ * This keeps one head's 64x128 tile contiguous for the sparse consumer. */
+kernel void h3_vsa_pack_qkvg_headmajor_bf16(
+    device const bfloat *query [[buffer(0)]],
+    device const bfloat *key [[buffer(1)]],
+    device const bfloat *value [[buffer(2)]],
+    device const bfloat *gate [[buffer(3)]],
+    device bfloat *tiled [[buffer(4)]],
+    device const uint *tiled_to_packed [[buffer(5)]],
+    constant h3_vsa_args &args [[buffer(6)]],
+    uint position [[thread_position_in_grid]]) {
+  const ulong width = ulong(args.heads) * args.head_dim;
+  const ulong section_elements = ulong(args.padded_rows) * width;
+  const ulong total = section_elements * 4ul;
+  if (ulong(position) >= total) return;
+
+  const uint section = uint(ulong(position) / section_elements);
+  const ulong local = ulong(position) - ulong(section) * section_elements;
+  const ulong head_rows = ulong(args.padded_rows) * args.head_dim;
+  const uint head = uint(local / head_rows);
+  const ulong within_head = local - ulong(head) * head_rows;
+  const uint tiled_row = uint(within_head / args.head_dim);
+  const uint dimension =
+      uint(within_head - ulong(tiled_row) * args.head_dim);
+
+  const uint packed_row = tiled_to_packed[tiled_row];
+  bfloat result = bfloat(0.0f);
+  if (packed_row != 0xffffffffu) {
+    const ulong source =
+        ulong(packed_row) * width + ulong(head) * args.head_dim + dimension;
+    result = section == 0 ? query[source] :
+             section == 1 ? key[source] :
+             section == 2 ? value[source] : gate[source];
+  }
+  tiled[position] = result;
+}
+
 template <typename T, int BD>
 [[kernel, max_total_threads_per_threadgroup(128)]] void vsa_pool_qkv(
     device const T *tiled [[buffer(0)]],
@@ -1156,6 +1195,39 @@ template <typename T, int BD>
     for (uint row = 0; row < size; row++)
       total += float(source[ulong(row) * width]);
     pooled[ulong(section) * summary_elements + output] = total / float(size);
+  }
+}
+
+
+template <typename T, int BD>
+[[kernel, max_total_threads_per_threadgroup(128)]]
+void vsa_pool_qkv_headmajor(
+    device const T *tiled [[buffer(0)]],
+    device float *pooled [[buffer(1)]],
+    device const uint *block_sizes [[buffer(2)]],
+    constant h3_vsa_args &args [[buffer(3)]],
+    uint dimension [[thread_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+  if (dimension >= BD) return;
+  const uint tile = group % args.tiles;
+  const uint head = group / args.tiles;
+  if (head >= args.heads) return;
+  const uint size = block_sizes[tile];
+  const ulong width = ulong(args.heads) * BD;
+  const ulong section_elements = ulong(args.padded_rows) * width;
+  const ulong summary_elements = ulong(args.heads) * args.tiles * BD;
+  const ulong input =
+      (ulong(head) * args.padded_rows + ulong(tile) * 64ul) * BD + dimension;
+  const ulong output = (ulong(head) * args.tiles + tile) * BD + dimension;
+
+  for (uint section = 0; section < 3; section++) {
+    float total = 0.0f;
+    const device T *source =
+        tiled + ulong(section) * section_elements + input;
+    for (uint row = 0; row < size; row++)
+      total += float(source[ulong(row) * BD]);
+    pooled[ulong(section) * summary_elements + output] =
+        total / float(size);
   }
 }
 
@@ -1401,6 +1473,158 @@ template <typename T, int BD, int BQ, int TGP_SIZE>
   }
 }
 
+
+template <typename T, int BD, int BQ, int TGP_SIZE>
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void vsa_attn_tiled_headmajor(
+    device const T *tiled [[buffer(0)]],
+    device const uint *selected [[buffer(1)]],
+    device const T *compressed [[buffer(2)]],
+    device const uint *block_sizes [[buffer(3)]],
+    device const uint *tiled_to_packed [[buffer(4)]],
+    device T *output [[buffer(5)]],
+    constant h3_vsa_args &args [[buffer(6)]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+  constexpr short BK = 64;
+  constexpr short LDQ = BD;
+  constexpr short LDK = BK;
+  constexpr short LDV = BD;
+  constexpr short TD = BD / 8;
+  constexpr short TK = BK / 8;
+  using AccumType = float;
+  using MMAFrag = BaseMMAFrag<AccumType, 8, 8>;
+  using QLoader = BlockLoaderT<T, BQ, BD, LDQ, 1, 1, TGP_SIZE>;
+  using KLoader = BlockLoaderT<T, BK, BD, 1, LDK, 0, TGP_SIZE>;
+  using VLoader = BlockLoaderT<T, BK, BD, LDV, 1, 0, TGP_SIZE>;
+
+  const uint query_tile = group % args.tiles;
+  const uint head = group / args.tiles;
+  if (head >= args.heads) return;
+  const uint query_start = query_tile * BQ;
+  const uint query_size = block_sizes[query_tile];
+  const ulong width = ulong(args.heads) * BD;
+  const ulong section_elements = ulong(args.padded_rows) * width;
+  const ulong head_base = ulong(head) * args.padded_rows * BD;
+  const device T *Q =
+      tiled + head_base + ulong(query_start) * BD;
+  const device T *K =
+      tiled + section_elements + head_base;
+  const device T *V =
+      tiled + section_elements * 2ul + head_base;
+  const device T *G =
+      tiled + section_elements * 3ul + head_base + ulong(query_start) * BD;
+
+  threadgroup T query_shared[BQ * LDQ];
+  threadgroup T key_value_shared[BK * BD];
+  threadgroup T *keys = key_value_shared;
+  threadgroup T *values = key_value_shared;
+  QLoader query_loader(Q, BD, query_shared, simdgroup, lane);
+  query_loader.load_safe(short2(BD, query_size));
+
+  MMATile<AccumType, 1, 1, MMAFrag> query_fragment;
+  MMATile<AccumType, 1, TK, MMAFrag> key_fragment;
+  MMATile<AccumType, 1, TK, MMAFrag> score_tile;
+  MMATile<AccumType, 1, TD, MMAFrag> output_tile;
+  output_tile.clear();
+  const short2 coordinate = MMAFrag::get_coord(lane);
+  const short row = coordinate.y;
+  const short column = coordinate.x;
+  const short query_row = 8 * simdgroup;
+  const short query_offset = (query_row + row) * LDQ + column;
+  const short key_offset = row * LDK + column;
+  const short value_offset = row * LDV + column;
+  constexpr short rows_per_thread = decltype(score_tile)::kRowsPerThread;
+  const AccumType score_scale = AccumType(args.scale * 1.44269504089f);
+  AccumType maximum[rows_per_thread];
+  AccumType denominator[rows_per_thread] = {0};
+  PREFILL_PRAGMA_UNROLL
+  for (short index = 0; index < rows_per_thread; index++)
+    maximum[index] = -INFINITY;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint route_count = query_tile < args.prefix_tiles
+      ? args.tiles : args.prefix_tiles + args.topk;
+  for (uint route = 0; route < route_count; route++) {
+    uint key_tile = route;
+    if (query_tile >= args.prefix_tiles && route >= args.prefix_tiles) {
+      const uint video_query = query_tile - args.prefix_tiles;
+      const ulong selected_offset =
+          (ulong(head) * args.video_tiles + video_query) * args.topk;
+      key_tile = selected[selected_offset + route - args.prefix_tiles];
+    }
+    const uint key_count = block_sizes[key_tile];
+    const uint key_start = key_tile * BK;
+    KLoader key_loader(
+        K + ulong(key_start) * BD, BD, keys, simdgroup, lane);
+    VLoader value_loader(
+        V + ulong(key_start) * BD, BD, values, simdgroup, lane);
+    key_loader.load_safe(short2(BD, key_count));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    score_tile.clear();
+    PREFILL_PRAGMA_UNROLL
+    for (short dim_tile = 0; dim_tile < TD; dim_tile++) {
+      query_fragment.template load<T, 1, 1, LDQ, 1>(
+          &query_shared[query_offset + dim_tile * 8]);
+      key_fragment.template load<T, 1, 1, LDK, 1>(
+          &keys[key_offset + dim_tile * 8 * LDK]);
+      simdgroup_barrier(mem_flags::mem_none);
+      tile_matmad(score_tile, query_fragment, key_fragment, score_tile);
+    }
+    PREFILL_PRAGMA_UNROLL
+    for (short key_fragment_index = 0;
+         key_fragment_index < TK; key_fragment_index++) {
+      PREFILL_PRAGMA_UNROLL
+      for (short element = 0; element < MMAFrag::kElemsPerFrag; element++)
+        score_tile.frag_at(0, key_fragment_index)[element] *= score_scale;
+      const short key_column = column + key_fragment_index * 8;
+      PREFILL_PRAGMA_UNROLL
+      for (short element = 0; element < MMAFrag::kElemCols; element++)
+        if (key_column + element >= key_count)
+          score_tile.frag_at(0, key_fragment_index)[element] = -INFINITY;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    value_loader.load_safe(short2(BD, key_count));
+    sol_accumulate_tile<false, T, AccumType,
+                        decltype(score_tile), decltype(output_tile), LDV>(
+        score_tile, output_tile, values, value_offset, maximum, denominator,
+        0, 0, args.tiles, args.padded_rows);
+  }
+
+  PREFILL_PRAGMA_UNROLL
+  for (short index = 0; index < rows_per_thread; index++)
+    if (maximum[index] == -INFINITY) denominator[index] = AccumType(1);
+  output_tile.template row_bin_op<DivOp>(denominator);
+
+  const uint local_row = uint(query_row + row);
+  if (local_row < query_size) {
+    const uint packed_row = tiled_to_packed[query_start + local_row];
+    const ulong output_base =
+        ulong(packed_row) * width + ulong(head) * BD;
+    const ulong gate_base = ulong(local_row) * BD;
+    const ulong compressed_base =
+        (ulong(query_tile) * args.heads + head) * BD;
+    PREFILL_PRAGMA_UNROLL
+    for (short dim_tile = 0; dim_tile < TD; dim_tile++) {
+      const uint dim = uint(dim_tile * 8 + column);
+      output[output_base + dim] = T(
+          output_tile.frag_at(0, dim_tile)[0] +
+          float(G[gate_base + dim]) *
+          float(compressed[compressed_base + dim]));
+      output[output_base + dim + 1] = T(
+          output_tile.frag_at(0, dim_tile)[1] +
+          float(G[gate_base + dim + 1]) *
+          float(compressed[compressed_base + dim + 1]));
+    }
+  }
+}
+
+instantiate_kernel("h3_vsa_pool_qkv_headmajor_bf16_d128",
+                   vsa_pool_qkv_headmajor, bfloat, 128)
+instantiate_kernel("h3_vsa_attn_headmajor_bf16_d128_bq64",
+                   vsa_attn_tiled_headmajor, bfloat, 128, 64, 256)
 instantiate_kernel("h3_vsa_pool_qkv_bf16_d128",
                    vsa_pool_qkv, bfloat, 128)
 instantiate_kernel("h3_vsa_route_compress_f32_d128",
