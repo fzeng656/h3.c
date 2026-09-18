@@ -523,6 +523,7 @@ static h3_gpu *h3_gpu_create_internal(const char *shader_source_path,
                 @"h3_vsa_pack_qkvg_bf16",
                 @"h3_vsa_pool_qkv_bf16_d128",
                 @"h3_vsa_route_compress_f32_d128",
+                @"h3_vsa_route_compress_simd4_f32_d128",
                 @"h3_vsa_attn_tiled_bf16_d128_bq64"
             ];
             if (!sparseLibrary) {
@@ -2771,10 +2772,27 @@ int h3_gpu_vsa_attention_bf16(
         gpu, @"h3_vsa_pack_qkvg_bf16");
     id<MTLComputePipelineState> pool = h3_gpu_pipeline(
         gpu, @"h3_vsa_pool_qkv_bf16_d128");
+    const char *vsa_route = getenv("H3_FASTH3_VSA_ROUTE");
+    BOOL use_simd_route =
+        vsa_route && !strcmp(vsa_route, "simd4");
     id<MTLComputePipelineState> route = h3_gpu_pipeline(
-        gpu, @"h3_vsa_route_compress_f32_d128");
+        gpu, use_simd_route
+            ? @"h3_vsa_route_compress_simd4_f32_d128"
+            : @"h3_vsa_route_compress_f32_d128");
     id<MTLComputePipelineState> attention = h3_gpu_pipeline(
         gpu, @"h3_vsa_attn_tiled_bf16_d128_bq64");
+    const char *route_label =
+        use_simd_route ? "route + top-k[simd]" : "route + top-k";
+    BOOL route_parity =
+        use_simd_route && getenv("H3_FASTH3_VSA_ROUTE_PARITY") != NULL;
+    id<MTLComputePipelineState> route_reference = route_parity
+        ? h3_gpu_pipeline(gpu, @"h3_vsa_route_compress_f32_d128") : nil;
+    id<MTLBuffer> route_reference_selected = route_parity
+        ? [gpu.device newBufferWithLength:selected_count * sizeof(uint32_t)
+                                  options:MTLResourceStorageModeShared] : nil;
+    id<MTLBuffer> route_reference_compressed = route_parity
+        ? [gpu.device newBufferWithLength:summary_count * sizeof(uint16_t)
+                                  options:MTLResourceStorageModeShared] : nil;
     NSUInteger score_bytes = (NSUInteger)tiles * sizeof(float);
     if (!pack || !pool || !route || !attention ||
         pool.maxTotalThreadsPerThreadgroup < 128 ||
@@ -2793,7 +2811,7 @@ int h3_gpu_vsa_attention_bf16(
         heads, head_dim, scale
     };
     NSUInteger compressed_offset = summary_count * 3u * sizeof(float);
-    BOOL profile_vsa = getenv("H3_PROFILE_VSA_STAGES") != NULL;
+    BOOL profile_vsa = getenv("H3_PROFILE_VSA_STAGES") != NULL || route_parity;
     double profile_gpu_last = gpu.stats.gpu_seconds;
 #define VSA_SPLIT_OR_BARRIER(stage_label) do {                                  \
     if (profile_vsa) {                                                          \
@@ -2836,6 +2854,18 @@ int h3_gpu_vsa_attention_bf16(
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         VSA_SPLIT_OR_BARRIER("pool QKV");
 
+        if (route_parity) {
+            [encoder setComputePipelineState:route_reference];
+            [encoder setBuffer:TENSOR(pooled_qkv).buffer offset:0 atIndex:0];
+            [encoder setBuffer:route_reference_selected offset:0 atIndex:1];
+            [encoder setBuffer:route_reference_compressed
+                         offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+            [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
         [encoder setComputePipelineState:route];
         [encoder setBuffer:TENSOR(pooled_qkv).buffer offset:0 atIndex:0];
         [encoder setBuffer:TENSOR(selected_video_tiles).buffer
@@ -2846,7 +2876,60 @@ int h3_gpu_vsa_attention_bf16(
         [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * tiles, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        VSA_SPLIT_OR_BARRIER("route + top-k");
+        VSA_SPLIT_OR_BARRIER(route_label);
+        if (route_parity) {
+            const uint32_t *reference = route_reference_selected.contents;
+            const uint32_t *candidate =
+                TENSOR(selected_video_tiles).buffer.contents;
+            size_t mismatches = 0;
+            size_t first_mismatch = SIZE_MAX;
+            for (size_t index = 0; index < selected_count; index++) {
+                if (reference[index] != candidate[index]) {
+                    if (first_mismatch == SIZE_MAX) first_mismatch = index;
+                    mismatches++;
+                }
+            }
+            if (first_mismatch == SIZE_MAX) {
+                fprintf(stderr,
+                        "h3 vsa-route-parity: selected=%zu mismatches=0 exact=yes\n",
+                        selected_count);
+            } else {
+                fprintf(stderr,
+                        "h3 vsa-route-parity: selected=%zu mismatches=%zu "
+                        "fraction=%.9g first=%zu ref=%u simd=%u\n",
+                        selected_count, mismatches,
+                        (double)mismatches / (double)selected_count,
+                        first_mismatch, reference[first_mismatch],
+                        candidate[first_mismatch]);
+            }
+            const uint16_t *compressed_reference =
+                route_reference_compressed.contents;
+            const uint16_t *compressed_candidate =
+                (const uint16_t *)((const unsigned char *)
+                    TENSOR(pooled_qkv).buffer.contents + compressed_offset);
+            size_t compressed_mismatches = 0;
+            size_t compressed_first = SIZE_MAX;
+            for (size_t index = 0; index < summary_count; index++) {
+                if (compressed_reference[index] != compressed_candidate[index]) {
+                    if (compressed_first == SIZE_MAX) compressed_first = index;
+                    compressed_mismatches++;
+                }
+            }
+            if (compressed_first == SIZE_MAX) {
+                fprintf(stderr,
+                        "h3 vsa-route-parity: compressed=%zu mismatches=0 exact=yes\n",
+                        summary_count);
+            } else {
+                fprintf(stderr,
+                        "h3 vsa-route-parity: compressed=%zu mismatches=%zu "
+                        "fraction=%.9g first=%zu ref=0x%04x simd=0x%04x\n",
+                        summary_count, compressed_mismatches,
+                        (double)compressed_mismatches / (double)summary_count,
+                        compressed_first,
+                        compressed_reference[compressed_first],
+                        compressed_candidate[compressed_first]);
+            }
+        }
 
         [encoder setComputePipelineState:attention];
         [encoder setBuffer:TENSOR(tiled_qkvg).buffer offset:0 atIndex:0];

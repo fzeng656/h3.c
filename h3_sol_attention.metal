@@ -1260,6 +1260,169 @@ template <int BD>
   }
 }
 
+
+/*
+ * Barrier-light VSA router for D=128.
+ *
+ * Four SIMD groups score four key tiles concurrently. Each lane accumulates
+ * four dimensions and the 32-lane SIMD group reduces without threadgroup
+ * barriers. Softmax normalization uses one cooperative reduction, while
+ * repeated top-k selection uses SIMD-local argmax plus four group leaders.
+ */
+template <int BD>
+[[kernel, max_total_threads_per_threadgroup(128)]]
+void vsa_route_compress_simd4(
+    device const float *pooled [[buffer(0)]],
+    device uint *selected [[buffer(1)]],
+    device bfloat *compressed [[buffer(2)]],
+    constant h3_vsa_args &args [[buffer(3)]],
+    threadgroup float *scores [[threadgroup(0)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+  static_assert(BD == 128, "SIMD4 router is specialized for D=128");
+  const uint query_tile = group % args.tiles;
+  const uint head = group / args.tiles;
+  if (head >= args.heads || tid >= BD) return;
+
+  const uint lane = tid & 31u;
+  const uint simdgroup = tid >> 5;
+  const ulong summary_elements = ulong(args.heads) * args.tiles * BD;
+  const device float *q_pool = pooled;
+  const device float *k_pool = pooled + summary_elements;
+  const device float *v_pool = pooled + summary_elements * 2ul;
+  const ulong query = (ulong(head) * args.tiles + query_tile) * BD;
+
+  threadgroup float reduction[BD];
+  threadgroup uint candidate_tiles[BD];
+
+  /* Score four key tiles in parallel, one per SIMD group. */
+  for (uint key_tile = simdgroup; key_tile < args.tiles; key_tile += 4u) {
+    const ulong key_offset = (ulong(head) * args.tiles + key_tile) * BD;
+    float sum = 0.0f;
+    for (uint dimension = lane; dimension < BD; dimension += 32u)
+      sum = fma(q_pool[query + dimension],
+                k_pool[key_offset + dimension], sum);
+
+    for (uint stride = 16u; stride; stride >>= 1u) {
+      const float partner = simd_shuffle_down(sum, stride);
+      if (lane < stride) sum += partner;
+    }
+    if (lane == 0)
+      scores[key_tile] = sum * args.scale;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  /* Parallel max reduction over tile scores. */
+  float local_maximum = -INFINITY;
+  for (uint key_tile = tid; key_tile < args.tiles; key_tile += BD)
+    local_maximum = max(local_maximum, scores[key_tile]);
+  reduction[tid] = local_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint stride = BD / 2; stride >= 32u; stride >>= 1u) {
+    if (tid < stride)
+      reduction[tid] = max(reduction[tid], reduction[tid + stride]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid < 32u) {
+    float value = reduction[tid];
+    for (uint stride = 16u; stride; stride >>= 1u) {
+      const float partner = simd_shuffle_down(value, stride);
+      if (tid < stride) value = max(value, partner);
+    }
+    if (tid == 0u) reduction[0] = value;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float maximum = reduction[0];
+
+  /* Parallel softmax denominator. */
+  float local_denominator = 0.0f;
+  for (uint key_tile = tid; key_tile < args.tiles; key_tile += BD)
+    local_denominator += exp(scores[key_tile] - maximum);
+  reduction[tid] = local_denominator;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint stride = BD / 2; stride >= 32u; stride >>= 1u) {
+    if (tid < stride)
+      reduction[tid] += reduction[tid + stride];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (tid < 32u) {
+    float value = reduction[tid];
+    for (uint stride = 16u; stride; stride >>= 1u) {
+      const float partner = simd_shuffle_down(value, stride);
+      if (tid < stride) value += partner;
+    }
+    if (tid == 0u) reduction[0] = value;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float denominator = reduction[0];
+
+  /* Compression branch: one output dimension per thread. */
+  float output = 0.0f;
+  for (uint key_tile = 0; key_tile < args.tiles; key_tile++) {
+    const ulong key_offset = (ulong(head) * args.tiles + key_tile) * BD;
+    output += exp(scores[key_tile] - maximum) *
+              v_pool[key_offset + tid];
+  }
+  const ulong compressed_offset =
+      (ulong(query_tile) * args.heads + head) * BD + tid;
+  compressed[compressed_offset] = bfloat(output / denominator);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (query_tile < args.prefix_tiles) return;
+
+  const uint video_query = query_tile - args.prefix_tiles;
+  const ulong destination =
+      (ulong(head) * args.video_tiles + video_query) * args.topk;
+
+  /*
+   * Repeated argmax, but with 32-lane SIMD reductions. Four SIMD-group
+   * leaders publish candidates; lane 0 chooses among those four.
+   */
+  for (uint rank = 0; rank < args.topk; rank++) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_score = -INFINITY;
+    uint best_tile = args.prefix_tiles;
+    for (uint video_tile = tid; video_tile < args.video_tiles;
+         video_tile += BD) {
+      const uint absolute = args.prefix_tiles + video_tile;
+      const float score = scores[absolute];
+      if (score > best_score) {
+        best_score = score;
+        best_tile = absolute;
+      }
+    }
+
+    for (uint stride = 16u; stride; stride >>= 1u) {
+      const float partner_score = simd_shuffle_down(best_score, stride);
+      const uint partner_tile = simd_shuffle_down(best_tile, stride);
+      if (lane < stride && partner_score > best_score) {
+        best_score = partner_score;
+        best_tile = partner_tile;
+      }
+    }
+
+    if (lane == 0u) {
+      reduction[simdgroup] = best_score;
+      candidate_tiles[simdgroup] = best_tile;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+      float winner_score = reduction[0];
+      uint winner_tile = candidate_tiles[0];
+      for (uint sg = 1; sg < 4u; sg++) {
+        if (reduction[sg] > winner_score) {
+          winner_score = reduction[sg];
+          winner_tile = candidate_tiles[sg];
+        }
+      }
+      selected[destination + rank] = winner_tile;
+      scores[winner_tile] = -INFINITY;
+    }
+  }
+}
+
 template <typename T, int BD, int BQ, int TGP_SIZE>
 [[kernel, max_total_threads_per_threadgroup(256)]] void vsa_attn_tiled(
     device const T *tiled [[buffer(0)]],
@@ -1405,5 +1568,7 @@ instantiate_kernel("h3_vsa_pool_qkv_bf16_d128",
                    vsa_pool_qkv, bfloat, 128)
 instantiate_kernel("h3_vsa_route_compress_f32_d128",
                    vsa_route_compress, 128)
+instantiate_kernel("h3_vsa_route_compress_simd4_f32_d128",
+                   vsa_route_compress_simd4, 128)
 instantiate_kernel("h3_vsa_attn_tiled_bf16_d128_bq64",
                    vsa_attn_tiled, bfloat, 128, 64, 256)
