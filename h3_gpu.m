@@ -523,7 +523,8 @@ static h3_gpu *h3_gpu_create_internal(const char *shader_source_path,
                 @"h3_vsa_pack_qkvg_bf16",
                 @"h3_vsa_pool_qkv_bf16_d128",
                 @"h3_vsa_route_compress_f32_d128",
-                @"h3_vsa_attn_tiled_bf16_d128_bq64"
+                @"h3_vsa_attn_tiled_bf16_d128_bq64",
+                @"h3_vsa_attn_simd_stream_bf16_d128"
             ];
             if (!sparseLibrary) {
                 if (error && error_size) {
@@ -2773,8 +2774,15 @@ int h3_gpu_vsa_attention_bf16(
         gpu, @"h3_vsa_pool_qkv_bf16_d128");
     id<MTLComputePipelineState> route = h3_gpu_pipeline(
         gpu, @"h3_vsa_route_compress_f32_d128");
+    const char *vsa_executor = getenv("H3_FASTH3_VSA_EXECUTOR");
+    BOOL use_simd_stream =
+        vsa_executor && !strcmp(vsa_executor, "simd_stream");
     id<MTLComputePipelineState> attention = h3_gpu_pipeline(
-        gpu, @"h3_vsa_attn_tiled_bf16_d128_bq64");
+        gpu, use_simd_stream
+            ? @"h3_vsa_attn_simd_stream_bf16_d128"
+            : @"h3_vsa_attn_tiled_bf16_d128_bq64");
+    const char *attention_label =
+        use_simd_stream ? "sparse attn+corr[simd]" : "sparse attn+corr";
     NSUInteger score_bytes = (NSUInteger)tiles * sizeof(float);
     if (!pack || !pool || !route || !attention ||
         pool.maxTotalThreadsPerThreadgroup < 128 ||
@@ -2867,7 +2875,7 @@ int h3_gpu_vsa_attention_bf16(
             double gpu_now = gpu.stats.gpu_seconds;
             fprintf(stderr,
                     "h3 vsa-profile: %-18s gpu=%9.3fms wall=%9.3fms\n",
-                    "sparse attn+corr",
+                    attention_label,
                     (gpu_now - profile_gpu_last) * 1000.0,
                     (h3_gpu_now() - wall_started) * 1000.0);
             profile_gpu_last = gpu_now;

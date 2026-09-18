@@ -1401,6 +1401,268 @@ template <typename T, int BD, int BQ, int TGP_SIZE>
   }
 }
 
+
+/*
+ * Experimental FastVideo-style SIMD-group streaming VSA consumer.
+ *
+ * This deliberately reuses the existing h3.c router/top-k/compression outputs.
+ * Each 256-thread threadgroup owns one (head, query tile), eight SIMD-groups
+ * own eight query rows each, and K/V are streamed eight key rows at a time.
+ * The baseline Steel consumer remains available and is still the default.
+ */
+METAL_FUNC void h3_vsa_scale_rows_simd8x8(
+    thread simdgroup_float8x8 &matrix,
+    const threadgroup float *row_scale,
+    threadgroup float *scratch,
+    uint lane) {
+  simdgroup_store(matrix, scratch, 8);
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane < 8) {
+    const float scale = row_scale[lane];
+    for (uint column = 0; column < 8; column++)
+      scratch[lane * 8 + column] *= scale;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_load(matrix, scratch, 8);
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void h3_vsa_attn_simd_stream_bf16_d128(
+    device const bfloat *tiled [[buffer(0)]],
+    device const uint *selected [[buffer(1)]],
+    device const bfloat *compressed [[buffer(2)]],
+    device const uint *block_sizes [[buffer(3)]],
+    device const uint *tiled_to_packed [[buffer(4)]],
+    device bfloat *output [[buffer(5)]],
+    constant h3_vsa_args &args [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]]) {
+  constexpr int TILE = 64;
+  constexpr int D = 128;
+  constexpr int SIMD = 32;
+  constexpr int SIMD_GROUPS = 8;
+  constexpr int QUERY_ROWS = 8;
+  constexpr int KEY_CHUNK = 8;
+
+  const uint simdgroup = tid / SIMD;
+  const uint lane = tid % SIMD;
+  const uint query_tile = group % args.tiles;
+  const uint head = group / args.tiles;
+  if (head >= args.heads) return;
+
+  const uint query_size = block_sizes[query_tile];
+  const ulong width = ulong(args.heads) * D;
+  const ulong section_elements = ulong(args.padded_rows) * width;
+  const uint query_start = query_tile * TILE;
+  const device bfloat *Q =
+      tiled + ulong(query_start) * width + ulong(head) * D;
+  const device bfloat *K =
+      tiled + section_elements + ulong(head) * D;
+  const device bfloat *V =
+      tiled + section_elements * 2ul + ulong(head) * D;
+  const device bfloat *G =
+      tiled + section_elements * 3ul +
+      ulong(query_start) * width + ulong(head) * D;
+
+  threadgroup float kv_shared[KEY_CHUNK * D];
+  threadgroup float score_shared[SIMD_GROUPS * 64];
+  threadgroup float scale_shared[SIMD_GROUPS * 64];
+  threadgroup float query_shared[SIMD_GROUPS * 64];
+  threadgroup float alpha_shared[SIMD_GROUPS * QUERY_ROWS];
+
+  threadgroup float *simd_scores = score_shared + simdgroup * 64;
+  threadgroup float *simd_scale = scale_shared + simdgroup * 64;
+  threadgroup float *simd_query = query_shared + simdgroup * 64;
+  threadgroup float *simd_alpha = alpha_shared + simdgroup * QUERY_ROWS;
+  const int query_row0 = int(simdgroup) * QUERY_ROWS;
+
+  thread simdgroup_float8x8 q_fragment[16];
+  for (int dim_tile = 0; dim_tile < 16; dim_tile++) {
+    const int row0 = int(lane) / 8;
+    const int column = int(lane) % 8;
+    const int global_row0 = query_row0 + row0;
+    const int global_row1 = global_row0 + 4;
+    float q0 = 0.0f;
+    float q1 = 0.0f;
+    if (global_row0 < int(query_size))
+      q0 = float(Q[ulong(global_row0) * width + dim_tile * 8 + column]);
+    if (global_row1 < int(query_size))
+      q1 = float(Q[ulong(global_row1) * width + dim_tile * 8 + column]);
+    simd_query[lane] = q0;
+    simd_query[lane + 32] = q1;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_load(q_fragment[dim_tile], simd_query, 8);
+  }
+
+  thread simdgroup_float8x8 accumulator[16];
+  for (int dim_tile = 0; dim_tile < 16; dim_tile++)
+    accumulator[dim_tile] =
+        make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  float row_maximum = -3.402823466e+38f;
+  float row_sum = 0.0f;
+  const uint route_count = query_tile < args.prefix_tiles
+      ? args.tiles : args.prefix_tiles + args.topk;
+
+  for (uint route = 0; route < route_count; route++) {
+    uint key_tile = route;
+    if (query_tile >= args.prefix_tiles && route >= args.prefix_tiles) {
+      const uint video_query = query_tile - args.prefix_tiles;
+      const ulong selected_offset =
+          (ulong(head) * args.video_tiles + video_query) * args.topk;
+      key_tile = selected[selected_offset + route - args.prefix_tiles];
+    }
+
+    const uint key_size = block_sizes[key_tile];
+    const uint key_start = key_tile * TILE;
+
+    for (int key_row0 = 0; key_row0 < TILE; key_row0 += KEY_CHUNK) {
+      for (uint index = tid; index < uint(KEY_CHUNK * D);
+           index += SIMD_GROUPS * SIMD) {
+        const int row = int(index) / D;
+        const int column = int(index) - row * D;
+        const int key_row = key_row0 + row;
+        float value = 0.0f;
+        if (key_row < int(key_size))
+          value = float(K[ulong(key_start + key_row) * width +
+                          ulong(head) * D + column]);
+        kv_shared[index] = value;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      thread simdgroup_float8x8 score_matrix =
+          make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+      for (int dim_tile = 0; dim_tile < 16; dim_tile++) {
+        simdgroup_float8x8 key_matrix;
+        simdgroup_load(
+            key_matrix,
+            (const threadgroup float *)(kv_shared + dim_tile * 8),
+            D, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(
+            score_matrix, q_fragment[dim_tile], key_matrix, score_matrix);
+      }
+      simdgroup_store(score_matrix, simd_scores, KEY_CHUNK);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
+      float scores[KEY_CHUNK];
+      float chunk_maximum = -3.402823466e+38f;
+      if (lane < QUERY_ROWS) {
+        const int query_row = query_row0 + int(lane);
+        if (query_row < int(query_size)) {
+          for (int key_index = 0; key_index < KEY_CHUNK; key_index++) {
+            const int key_row = key_row0 + key_index;
+            float score = -3.402823466e+38f;
+            if (key_row < int(key_size))
+              score = simd_scores[int(lane) * KEY_CHUNK + key_index] *
+                      args.scale;
+            scores[key_index] = score;
+            chunk_maximum = metal::max(chunk_maximum, score);
+          }
+          const float new_maximum = metal::max(row_maximum, chunk_maximum);
+          const float alpha = metal::exp(row_maximum - new_maximum);
+          row_sum *= alpha;
+          row_maximum = new_maximum;
+          simd_alpha[int(lane)] = alpha;
+        } else {
+          for (int key_index = 0; key_index < KEY_CHUNK; key_index++)
+            scores[key_index] = -3.402823466e+38f;
+          simd_alpha[int(lane)] = 1.0f;
+        }
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (int dim_tile = 0; dim_tile < 16; dim_tile++)
+        h3_vsa_scale_rows_simd8x8(
+            accumulator[dim_tile], simd_alpha, simd_scale, lane);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (uint index = tid; index < uint(KEY_CHUNK * D);
+           index += SIMD_GROUPS * SIMD) {
+        const int row = int(index) / D;
+        const int column = int(index) - row * D;
+        const int key_row = key_row0 + row;
+        float value = 0.0f;
+        if (key_row < int(key_size))
+          value = float(V[ulong(key_start + key_row) * width +
+                          ulong(head) * D + column]);
+        kv_shared[index] = value;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (lane < QUERY_ROWS) {
+        const int query_row = query_row0 + int(lane);
+        float local_sum = 0.0f;
+        for (int key_index = 0; key_index < KEY_CHUNK; key_index++) {
+          float probability = 0.0f;
+          if (query_row < int(query_size) &&
+              key_row0 + key_index < int(key_size))
+            probability = metal::exp(scores[key_index] - row_maximum);
+          simd_scores[int(lane) * KEY_CHUNK + key_index] = probability;
+          local_sum += probability;
+        }
+        if (query_row < int(query_size)) row_sum += local_sum;
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
+      thread simdgroup_float8x8 probability_matrix;
+      simdgroup_load(probability_matrix, simd_scores, KEY_CHUNK);
+      for (int dim_tile = 0; dim_tile < 16; dim_tile++) {
+        simdgroup_float8x8 value_matrix;
+        simdgroup_load(
+            value_matrix,
+            (const threadgroup float *)(kv_shared + dim_tile * 8), D);
+        simdgroup_multiply_accumulate(
+            accumulator[dim_tile], probability_matrix, value_matrix,
+            accumulator[dim_tile]);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  if (lane < QUERY_ROWS) {
+    const int query_row = query_row0 + int(lane);
+    simd_alpha[int(lane)] =
+        query_row < int(query_size) && row_sum > 0.0f
+            ? 1.0f / row_sum : 0.0f;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  const ulong compressed_base =
+      (ulong(query_tile) * args.heads + head) * D;
+  for (int dim_tile = 0; dim_tile < 16; dim_tile++) {
+    h3_vsa_scale_rows_simd8x8(
+        accumulator[dim_tile], simd_alpha, simd_scale, lane);
+    simdgroup_store(accumulator[dim_tile], simd_scale, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int row0 = int(lane) / 8;
+    const int column = int(lane) % 8;
+    const int global_row0 = query_row0 + row0;
+    const int global_row1 = global_row0 + 4;
+    const uint dimension = uint(dim_tile * 8 + column);
+
+    if (global_row0 < int(query_size)) {
+      const uint packed_row = tiled_to_packed[query_start + global_row0];
+      const ulong output_base =
+          ulong(packed_row) * width + ulong(head) * D + dimension;
+      const float correction =
+          float(G[ulong(global_row0) * width + dimension]) *
+          float(compressed[compressed_base + dimension]);
+      output[output_base] = bfloat(simd_scale[lane] + correction);
+    }
+    if (global_row1 < int(query_size)) {
+      const uint packed_row = tiled_to_packed[query_start + global_row1];
+      const ulong output_base =
+          ulong(packed_row) * width + ulong(head) * D + dimension;
+      const float correction =
+          float(G[ulong(global_row1) * width + dimension]) *
+          float(compressed[compressed_base + dimension]);
+      output[output_base] = bfloat(simd_scale[lane + 32] + correction);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
 instantiate_kernel("h3_vsa_pool_qkv_bf16_d128",
                    vsa_pool_qkv, bfloat, 128)
 instantiate_kernel("h3_vsa_route_compress_f32_d128",
