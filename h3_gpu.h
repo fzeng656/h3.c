@@ -325,6 +325,19 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *weight,
                        const h3_gpu_tensor *bias, uint32_t rows,
                        uint32_t input_dim, uint32_t output_dim);
+/* Force the M5 BF16 TensorOps linear when the shape supports it;
+ * otherwise fall back to h3_gpu_linear_bf16. Intended for isolated
+ * low-rank adapters so their route can be optimized without changing the
+ * base model's GEMM route. */
+int h3_gpu_linear_bf16_nax_force(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim);
+int h3_gpu_lora_accum_bf16_nax(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight, uint32_t rows,
+                       uint32_t rank, uint32_t output_dim);
 int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input,
                     const h3_gpu_tensor *fc1_weight,

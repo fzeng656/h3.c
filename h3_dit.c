@@ -2,6 +2,7 @@
 
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
+#include "h3_lora.h"
 
 #include <math.h>
 #include <errno.h>
@@ -52,6 +53,13 @@ typedef struct {
     h3_gpu_tensor *fc2_scales;
 } h3_dit_block;
 
+typedef struct {
+    h3_lora_factor qkv;
+    h3_lora_factor out;
+    h3_lora_factor fc1;
+    h3_lora_factor fc2;
+} h3_dit_lora_block;
+
 enum {
     STREAM_QKV,
     STREAM_OUT,
@@ -75,6 +83,11 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    h3_lora *lora;
+    h3_dit_lora_block lora_blocks[H3_DIT_BLOCKS];
+    h3_dit_lora_block lora_refiner[2];
+    h3_gpu_tensor *lora_scratch;
+    h3_gpu_tensor *lora_delta;
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
@@ -865,6 +878,31 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc2_scales);
 }
 
+static void free_lora_block(h3_dit_lora_block *block) {
+    h3_lora_factor_free(&block->qkv);
+    h3_lora_factor_free(&block->out);
+    h3_lora_factor_free(&block->fc1);
+    h3_lora_factor_free(&block->fc2);
+}
+
+static int load_lora_block(h3_dit *dit, h3_dit_lora_block *block,
+                           const char *prefix, char *error,
+                           size_t error_size) {
+    if (!dit->lora) return 1;
+    char name[160];
+#define LOAD_LORA(field, suffix, input, output) do {                           \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    if (!h3_lora_load_factor(dit->lora, dit->gpu, name, input, output,         \
+                             &block->field, error, error_size)) return 0;       \
+} while (0)
+    LOAD_LORA(qkv, "attn.qkv_proj", HIDDEN, INNER * 3);
+    LOAD_LORA(out, "attn.out_proj", INNER, HIDDEN);
+    LOAD_LORA(fc1, "mlp.fc1", HIDDEN, FFN * 2);
+    LOAD_LORA(fc2, "mlp.fc2", FFN, HIDDEN);
+#undef LOAD_LORA
+    return 1;
+}
+
 static double stream_now(void) {
     struct timespec value;
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
@@ -1065,6 +1103,9 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
 }
 
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
+                             h3_dit_lora_block *lora,
+                             h3_gpu_tensor *lora_scratch,
+                             h3_gpu_tensor *lora_delta,
                              h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                              h3_gpu_tensor *qkv, h3_gpu_tensor *query,
                              h3_gpu_tensor *key, h3_gpu_tensor *value,
@@ -1079,6 +1120,9 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              HIDDEN, 1e-5f), "refiner attention norm");
     OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
                            HIDDEN, INNER * 3), "refiner QKV");
+    OP(h3_lora_apply(dit->gpu, dit->lora, &lora->qkv, norm, qkv,
+                     lora_scratch, lora_delta, rows, error, error_size),
+       "refiner QKV LoRA");
     OP(h3_gpu_grouped_qkv_rope_bf16(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
@@ -1089,16 +1133,25 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
        "refiner attention");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
                            INNER, HIDDEN), "refiner attention output");
+    OP(h3_lora_apply(dit->gpu, dit->lora, &lora->out, heads, branch,
+                     lora_scratch, lora_delta, rows, error, error_size),
+       "refiner attention output LoRA");
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner attention residual");
     OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
                              HIDDEN, 1e-5f), "refiner MLP norm");
     OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
                            HIDDEN, FFN * 2), "refiner MLP input");
+    OP(h3_lora_apply(dit->gpu, dit->lora, &lora->fc1, norm, fc1,
+                     lora_scratch, lora_delta, rows, error, error_size),
+       "refiner FC1 LoRA");
     OP(h3_gpu_swiglu_bf16(dit->gpu, activated, fc1, rows, FFN),
        "refiner SwiGLU");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, activated, weight->fc2, NULL,
                            rows, FFN, HIDDEN), "refiner MLP output");
+    OP(h3_lora_apply(dit->gpu, dit->lora, &lora->fc2, activated, branch,
+                     lora_scratch, lora_delta, rows, error, error_size),
+       "refiner FC2 LoRA");
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner MLP residual");
 #undef OP
@@ -1119,11 +1172,16 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     h3_gpu_tensor *norm = NULL, *qkv = NULL, *query = NULL, *key = NULL;
     h3_gpu_tensor *value = NULL, *heads = NULL, *branch = NULL, *fc1 = NULL;
     h3_gpu_tensor *activated = NULL;
+    h3_gpu_tensor *lora_scratch = NULL, *lora_delta = NULL;
     int ok = source && condition_w && condition_b &&
         load_block(dit, &refiner[0], "token_refiner.blocks.0.",
                    error, error_size) &&
         load_block(dit, &refiner[1], "token_refiner.blocks.1.",
-                   error, error_size);
+                   error, error_size) &&
+        load_lora_block(dit, &dit->lora_refiner[0],
+                        "token_refiner.blocks.0.", error, error_size) &&
+        load_lora_block(dit, &dit->lora_refiner[1],
+                        "token_refiner.blocks.1.", error, error_size);
     if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
     size_t rows = dit->text_rows;
@@ -1138,8 +1196,14 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
         branch = h3_gpu_tensor_new_bf16(dit->gpu, rows * HIDDEN);
         fc1 = h3_gpu_tensor_new_bf16(dit->gpu, rows * FFN * 2);
         activated = h3_gpu_tensor_new_bf16(dit->gpu, rows * FFN);
+        if (dit->lora && h3_lora_scale(dit->lora) != 0.0f) {
+            lora_scratch = h3_gpu_tensor_new_bf16(dit->gpu, rows * 64);
+            lora_delta = h3_gpu_tensor_new_bf16(dit->gpu, rows * FFN * 2);
+        }
         ok = dit->refined_text && norm && qkv && query && key && value &&
-             heads && branch && fc1 && activated;
+             heads && branch && fc1 && activated &&
+             (!dit->lora || h3_lora_scale(dit->lora) == 0.0f ||
+              (lora_scratch && lora_delta));
     }
     if (!ok) {
         if (!error || !*error)
@@ -1153,10 +1217,12 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
              dit->gpu, dit->refined_text, source, condition_w, condition_b,
              dit->text_rows, TEXT_DIM, HIDDEN), error, error_size,
              "condition projection") &&
-         run_refiner_block(dit, &refiner[0], dit->refined_text, norm, qkv,
+         run_refiner_block(dit, &refiner[0], &dit->lora_refiner[0],
+             lora_scratch, lora_delta, dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
              error, error_size) &&
-         run_refiner_block(dit, &refiner[1], dit->refined_text, norm, qkv,
+         run_refiner_block(dit, &refiner[1], &dit->lora_refiner[1],
+             lora_scratch, lora_delta, dit->refined_text, norm, qkv,
              query, key, value, heads, branch, fc1, activated,
              error, error_size) &&
          gpu_op(dit, h3_gpu_rms_norm_bf16(
@@ -1181,6 +1247,8 @@ cleanup:
     free_tensor(&branch);
     free_tensor(&fc1);
     free_tensor(&activated);
+    free_tensor(&lora_scratch);
+    free_tensor(&lora_delta);
     return ok;
 }
 
@@ -1806,6 +1874,21 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
         dit->mlp_output = h3_gpu_tensor_new_bf16(
             dit->gpu, sequence * HIDDEN);
     }
+    if (dit->lora && h3_lora_scale(dit->lora) != 0.0f) {
+        int fused_lora_accum = getenv("H3_TURBO_NAX_LORA") &&
+                               getenv("H3_TURBO_NAX_LORA_ACCUM");
+        dit->lora_scratch = h3_gpu_tensor_new_bf16(
+            dit->gpu, sequence * 64);
+        if (!fused_lora_accum)
+            dit->lora_delta = h3_gpu_tensor_new_bf16(
+                dit->gpu, sequence * FFN * 2);
+        if (!dit->lora_scratch || (!fused_lora_accum && !dit->lora_delta)) {
+            fail(error, error_size,
+                 "cannot allocate Turbo LoRA activations: %s",
+                 h3_gpu_error(dit->gpu));
+            return 0;
+        }
+    }
     if (!dit->attention_heads || !dit->mod_mlp ||
         (!dit->activation_aliases && !dit->mlp_output)) {
         fail(error, error_size,
@@ -2009,6 +2092,30 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    const char *turbo_lora = getenv("H3_TURBO_LORA");
+    if (turbo_lora && *turbo_lora) {
+        float turbo_scale = 1.0f;
+        const char *scale_text = getenv("H3_TURBO_LORA_SCALE");
+        if (scale_text && *scale_text) turbo_scale = strtof(scale_text, NULL);
+        dit->lora = h3_lora_open(turbo_lora, turbo_scale,
+                                 error, error_size);
+        if (!dit->lora) goto failed;
+        if (turbo_scale != 0.0f) {
+            /* Correctness-first Turbo path. Experiments can restore one fast
+             * projection at a time without hiding the LoRA insertion point. */
+            int turbo_int8_qkv = getenv("H3_TURBO_INT8_QKV") != NULL;
+            dit->fused_mlp = 0;
+            use_slower_bf16_mlp = 1;
+            if (!turbo_int8_qkv) use_slower_bf16_qkv = 1;
+            use_slower_row_major_attention_output = 1;
+        }
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: Turbo LoRA %s scale %.3f (%s%s path)\n",
+                    turbo_lora, turbo_scale,
+                    turbo_scale == 0.0f ? "bypass" : "correctness",
+                    turbo_scale != 0.0f && getenv("H3_TURBO_INT8_QKV") ?
+                        "+int8-qkv" : "");
+    }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -2051,7 +2158,8 @@ static h3_dit *load_dit(const char *weight_directory,
     schedule_progress schedule_state = {progress, progress_opaque};
     phase_started = stream_now();
     dit->schedule = h3_dit_schedule_precompute(
-        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
+        dit->weights, dit->gpu, dit->lora, sigmas,
+        dit->video_condition_rows != 0,
         dit->audio_condition_rows != 0, schedule_report, &schedule_state,
         error, error_size);
     double phase_schedule = stream_now() - phase_started;
@@ -2067,6 +2175,14 @@ static h3_dit *load_dit(const char *weight_directory,
         !prepare_token_reduction_maps(dit, error, error_size)) goto failed;
     double phase_maps = stream_now() - phase_started;
     phase_started = stream_now();
+    if (dit->lora) {
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "blocks.%u.", block);
+            if (!load_lora_block(dit, &dit->lora_blocks[block], prefix,
+                                 error, error_size)) goto failed;
+        }
+    }
     if (!load_core(dit, progress, progress_opaque, error, error_size)) goto failed;
     double phase_core = stream_now() - phase_started;
     phase_started = stream_now();
@@ -2293,7 +2409,26 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    int turbo_active = dit->lora && h3_lora_scale(dit->lora) != 0.0f;
+    int turbo_int8_qkv = turbo_active && getenv("H3_TURBO_INT8_QKV") != NULL;
+    if (turbo_int8_qkv && dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+        h3_dit_lora_block *lb = &dit->lora_blocks[index];
+        OP(h3_gpu_linear_int8_bf16(
+            dit->gpu, dit->qkv, dit->int8_activation,
+            dit->int8_activation_scales, dit->mod_attention,
+            weight->qkv_int8, weight->qkv_scales, rows, HIDDEN, INNER * 3,
+            dit->use_slower_uncached_int8_scales),
+           "DiT Turbo int8 QKV projection");
+        OP(h3_lora_apply(
+            dit->gpu, dit->lora, &lb->qkv, dit->mod_attention, dit->qkv,
+            dit->lora_scratch, dit->lora_delta, rows, error, error_size),
+           "DiT Turbo QKV LoRA");
+        OP(h3_gpu_grouped_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin, rows,
+            HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "DiT Turbo int8 QKV norm/RoPE");
+    } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -2305,6 +2440,20 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->use_slower_scalar_qkv_rms,
             dit->use_slower_uncached_int8_scales),
            "DiT int8 QKV projection/norm/RoPE");
+    } else if (turbo_active) {
+        h3_dit_lora_block *lb = &dit->lora_blocks[index];
+        OP(h3_gpu_linear_bf16(
+            dit->gpu, dit->qkv, dit->mod_attention, weight->qkv, NULL,
+            rows, HIDDEN, INNER * 3), "DiT Turbo base QKV");
+        OP(h3_lora_apply(
+            dit->gpu, dit->lora, &lb->qkv, dit->mod_attention, dit->qkv,
+            dit->lora_scratch, dit->lora_delta, rows, error, error_size),
+           "DiT Turbo QKV LoRA");
+        OP(h3_gpu_grouped_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin, rows,
+            HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "DiT Turbo QKV norm/RoPE");
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(
             dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
@@ -2346,6 +2495,14 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
+    }
+    if (dit->lora && h3_lora_scale(dit->lora) != 0.0f) {
+        h3_dit_lora_block *lb = &dit->lora_blocks[index];
+        OP(h3_lora_apply(
+            dit->gpu, dit->lora, &lb->out, dit->attention_heads,
+            dit->attention_output, dit->lora_scratch, dit->lora_delta,
+            rows, error, error_size),
+           "DiT Turbo attention-output LoRA");
     }
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
@@ -2402,10 +2559,24 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     } else {
         OP(h3_gpu_linear_bf16(dit->gpu, dit->fc1, dit->mod_mlp, weight->fc1,
             NULL, rows, HIDDEN, FFN * 2), "DiT MLP input");
+        if (dit->lora && h3_lora_scale(dit->lora) != 0.0f) {
+            h3_dit_lora_block *lb = &dit->lora_blocks[index];
+            OP(h3_lora_apply(
+                dit->gpu, dit->lora, &lb->fc1, dit->mod_mlp, dit->fc1,
+                dit->lora_scratch, dit->lora_delta, rows, error, error_size),
+               "DiT Turbo FC1 LoRA");
+        }
         OP(h3_gpu_swiglu_bf16(dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT SwiGLU");
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
+        if (dit->lora && h3_lora_scale(dit->lora) != 0.0f) {
+            h3_dit_lora_block *lb = &dit->lora_blocks[index];
+            OP(h3_lora_apply(
+                dit->gpu, dit->lora, &lb->fc2, dit->activated, mlp_output,
+                dit->lora_scratch, dit->lora_delta, rows, error, error_size),
+               "DiT Turbo FC2 LoRA");
+        }
     }
     if (fuse_next_attention) {
         h3_dit_block *next_weight = &dit->blocks[next_index];
@@ -2414,7 +2585,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         int fuse_int8_qkv_input = dit->int8_qkv &&
             !dit->use_slower_unfused_int8_inputs &&
             !getenv("H3_DISABLE_INT8_QKV") &&
-            !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT");
+            !getenv("H3_DISABLE_FUSED_INT8_QKV_INPUT") &&
+            !(turbo_active && getenv("H3_TURBO_INT8_QKV"));
         if (fuse_int8_qkv_input) {
             uint32_t padded_rows = (rows + 127u) & ~127u;
             OP(h3_gpu_gate_adaln_quantize_int8(
@@ -3409,8 +3581,12 @@ void h3_dit_free(h3_dit *dit) {
     free_tensor(&dit->reduced_rope_sin);
     free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
     free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
-    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         free_block(&dit->blocks[block]);
+        free_lora_block(&dit->lora_blocks[block]);
+    }
+    free_lora_block(&dit->lora_refiner[0]);
+    free_lora_block(&dit->lora_refiner[1]);
     free_block(&dit->stream_slots[0]);
     free_block(&dit->stream_slots[1]);
     free_tensor(&dit->final_norm);
@@ -3438,8 +3614,10 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_output);
     FREE(audio_output_bf16); FREE(video_output_bf16);
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
+    FREE(lora_scratch); FREE(lora_delta);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
+    h3_lora_free(dit->lora);
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,

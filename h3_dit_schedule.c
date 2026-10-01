@@ -1,4 +1,5 @@
 #include "h3_dit_schedule.h"
+#include "h3_lora.h"
 
 #include <math.h>
 #include <errno.h>
@@ -449,7 +450,7 @@ static int adaln_cache_write(h3_dit_schedule *schedule,
 }
 
 h3_dit_schedule *h3_dit_schedule_precompute(
-    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_weight_store *weights, h3_gpu *gpu, const h3_lora *lora,
     const h3_sigma_schedule *sigmas, int visual_condition,
     int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
@@ -469,7 +470,8 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     float *features = NULL;
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
                       &features, error, error_size)) goto failed;
-    if (adaln_cache_try_load(schedule, sigmas, visual_condition,
+    if ((!lora || h3_lora_scale(lora) == 0.0f) &&
+        adaln_cache_try_load(schedule, sigmas, visual_condition,
                              audio_condition, progress, progress_opaque,
                              error, error_size)) {
         free(features);
@@ -480,6 +482,17 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     free(features);
     features = NULL;
     if (!time) goto failed;
+    h3_gpu_tensor *lora_scratch = NULL, *lora_delta = NULL;
+    if (lora && h3_lora_scale(lora) != 0.0f) {
+        lora_scratch = h3_gpu_tensor_new_bf16(gpu, (size_t)schedule->time_rows * 64);
+        lora_delta = h3_gpu_tensor_new_bf16(gpu, (size_t)schedule->time_rows * BLOCK_OUTPUT);
+        if (!lora_scratch || !lora_delta) {
+            fail(error, error_size, "cannot allocate Turbo AdaLN scratch: %s",
+                 h3_gpu_error(gpu));
+            free_tensor(&lora_scratch); free_tensor(&lora_delta);
+            h3_gpu_tensor_free(time); goto failed;
+        }
+    }
 
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
         char weight_name[128], bias_name[128], operation[128];
@@ -504,12 +517,21 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             goto failed;
         }
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
-        int ok = gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
+        h3_lora_factor lf = {0};
+        char module[128];
+        snprintf(module, sizeof(module), "blocks.%u.adaln_proj.linear", block);
+        int ok = h3_lora_load_factor(lora, gpu, module, H3_DIT_TIME_DIM,
+                                     BLOCK_OUTPUT, &lf, error, error_size) &&
+            gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
             gpu_op(gpu, h3_gpu_linear_bf16(
                 gpu, schedule->blocks[block], time, weight, bias,
                 schedule->time_rows, H3_DIT_TIME_DIM, BLOCK_OUTPUT),
                 error, error_size, operation) &&
+            h3_lora_apply(gpu, lora, &lf, time, schedule->blocks[block],
+                          lora_scratch, lora_delta, schedule->time_rows,
+                          error, error_size) &&
             gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation);
+        h3_lora_factor_free(&lf);
         free_tensor(&weight);
         free_tensor(&bias);
         if (!ok) {
@@ -528,13 +550,20 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         FINAL_OUTPUT, error, error_size);
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
-    if (!final_w || !final_b || !schedule->final ||
+    h3_lora_factor final_lf = {0};
+    int final_lora_ok = h3_lora_load_factor(
+        lora, gpu, "final_layer.adaln_proj.linear", H3_DIT_TIME_DIM,
+        FINAL_OUTPUT, &final_lf, error, error_size);
+    if (!final_w || !final_b || !schedule->final || !final_lora_ok ||
         !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                 "begin final AdaLN") ||
         !gpu_op(gpu, h3_gpu_linear_bf16(
             gpu, schedule->final, time, final_w, final_b, schedule->time_rows,
             H3_DIT_TIME_DIM, FINAL_OUTPUT), error, error_size,
             "final AdaLN projection") ||
+        !h3_lora_apply(gpu, lora, &final_lf, time, schedule->final,
+                       lora_scratch, lora_delta, schedule->time_rows,
+                       error, error_size) ||
         !gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
                 "submit final AdaLN")) {
         if ((!error || !*error) && (!final_w || !final_b || !schedule->final))
@@ -542,13 +571,17 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                  h3_gpu_error(gpu));
         free_tensor(&final_w);
         free_tensor(&final_b);
+        h3_lora_factor_free(&final_lf);
+        free_tensor(&lora_scratch); free_tensor(&lora_delta);
         h3_gpu_tensor_free(time);
         goto failed;
     }
     free_tensor(&final_w);
     free_tensor(&final_b);
+    h3_lora_factor_free(&final_lf);
+    free_tensor(&lora_scratch); free_tensor(&lora_delta);
     h3_gpu_tensor_free(time);
-    {
+    if (!lora || h3_lora_scale(lora) == 0.0f) {
         char cache_detail[384] = {0};
         if (!adaln_cache_write(schedule, sigmas, visual_condition,
                                audio_condition, cache_detail,

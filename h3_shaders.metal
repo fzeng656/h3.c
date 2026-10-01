@@ -1046,6 +1046,54 @@ kernel void h3_linear_bf16_nax_r128(
     mm.run(mx, mw, my);
 }
 
+
+/* Runtime LoRA B projection for rank-64 adapters.  Preserve the existing
+ * numerical boundary by first rounding the matmul tile to BF16 in
+ * threadgroup memory, then adding that rounded delta to the already-rounded
+ * base projection and rounding once more on the store.  This avoids a full
+ * [rows,output_dim] delta allocation/write/read plus a separate add pass. */
+kernel void h3_lora_accum_bf16_nax_r128(
+                           device bfloat *input [[buffer(0)]],
+                           device bfloat *weight [[buffer(1)]],
+                           device bfloat *output [[buffer(2)]],
+                           constant linear_args &args [[buffer(3)]],
+                           threadgroup bfloat *delta_tile [[threadgroup(0)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint ROW_TILE = 128;
+    constexpr uint COLUMN_TILE = 64;
+    auto x = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim, (int)args.rows));
+    auto w = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(
+        weight,
+        dextents<int32_t, 2>((int)args.input_dim, (int)args.output_dim));
+    auto mx = x.slice(0, (int)group.x * (int)ROW_TILE);
+    auto mw = w.slice(0, (int)group.y * (int)COLUMN_TILE);
+    auto tg = tensor(delta_tile,
+        dextents<int32_t, 2>((int)COLUMN_TILE, (int)ROW_TILE));
+    matmul2d<matmul2d_descriptor(ROW_TILE, COLUMN_TILE, dynamic_extent,
+                                false, true, false),
+              execution_simdgroups<4>> mm;
+    auto accum = mm.template get_destination_cooperative_tensor<
+        decltype(x), decltype(w), bfloat>();
+    mm.run(mx, mw, accum);
+    accum.store(tg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint row_base = group.x * ROW_TILE;
+    uint column_base = group.y * COLUMN_TILE;
+    for (uint index = tid; index < ROW_TILE * COLUMN_TILE; index += 128) {
+        uint local_row = index / COLUMN_TILE;
+        uint local_col = index - local_row * COLUMN_TILE;
+        uint row = row_base + local_row;
+        uint column = column_base + local_col;
+        if (row < args.rows && column < args.output_dim) {
+            uint dst = row * args.output_dim + column;
+            output[dst] = (bfloat)((float)output[dst] +
+                                   (float)delta_tile[index]);
+        }
+    }
+}
+
 kernel void h3_linear_bf16_nax_r128_morton(
                            device bfloat *input [[buffer(0)]],
                            device bfloat *weight [[buffer(1)]],

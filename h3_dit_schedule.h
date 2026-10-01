@@ -4,6 +4,7 @@
 #include "h3_gpu.h"
 #include "h3_host.h"
 #include "h3_weights.h"
+#include "h3_lora.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -23,7 +24,7 @@ typedef void (*h3_dit_schedule_progress)(int completed_blocks,
  * projection at a time, so a 498 MiB block projection is released before the
  * next is loaded. */
 h3_dit_schedule *h3_dit_schedule_precompute(
-    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_weight_store *weights, h3_gpu *gpu, const h3_lora *lora,
     const h3_sigma_schedule *sigmas, int visual_condition,
     int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,

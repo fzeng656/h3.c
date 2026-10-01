@@ -440,6 +440,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
+            [names addObject:@"h3_lora_accum_bf16_nax_r128"];
             [names addObject:@"h3_linear_bf16_nax_r128_morton"];
             [names addObject:@"h3_linear_bf16_nax_r128_morton4"];
             [names addObject:
@@ -2825,6 +2826,136 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     }
     h3_gpu_stats stats = gpu.stats;
     stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+
+int h3_gpu_linear_bf16_nax_force(h3_gpu *opaque, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight,
+                       const h3_gpu_tensor *bias, uint32_t rows,
+                       uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)rows * input_dim;
+    size_t weight_count = (size_t)output_dim * input_dim;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!h3_gpu_require_bf16(gpu, input, input_count, @"forced NAX linear input") ||
+        !h3_gpu_require_bf16(gpu, weight, weight_count, @"forced NAX linear weight") ||
+        !h3_gpu_require_bf16(gpu, output, output_count, @"forced NAX linear output") ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
+                                      @"forced NAX linear bias"))) return 0;
+    if (!gpu.tensorOpsEnabled || bias || rows < 128 ||
+        (input_dim % 32) != 0 || (output_dim % 64) != 0 ||
+        getenv("H3_DISABLE_NAX_LINEAR"))
+        return h3_gpu_linear_bf16(opaque, output, input, weight, bias,
+                                  rows, input_dim, output_dim);
+    if (!h3_gpu_require_command(gpu)) return 0;
+    const char *splitRowsValue = getenv("H3_NAX_SPLIT_ROWS");
+    BOOL splitRows = rows > 2048;
+    uint32_t splitAt = splitRows ? 2048 : rows;
+    if (splitRowsValue && *splitRowsValue) {
+        unsigned long requested = strtoul(splitRowsValue, NULL, 10);
+        if (requested >= 128 && requested <= 2048) splitAt = (uint32_t)requested;
+    }
+    uint32_t column_tiles = (output_dim + 63) / 64;
+    BOOL morton4 = rows <= 2048 && !(column_tiles % 4) &&
+                   getenv("H3_DISABLE_NAX_LINEAR_MORTON4") == NULL;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, morton4 ? @"h3_linear_bf16_nax_r128_morton4" :
+                       @"h3_linear_bf16_nax_r128");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch forced M5 BF16 TensorOps");
+        return 0;
+    }
+    uint32_t dispatches = 0;
+    for (uint32_t rowOffset = 0; rowOffset < rows; rowOffset += splitAt)
+        @autoreleasepool {
+        uint32_t chunkRows = MIN(splitAt, rows - rowOffset);
+        linear_args args = {chunkRows, input_dim, output_dim, 0};
+        uint32_t row_tiles = (chunkRows + 127) / 128;
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer
+                     offset:(NSUInteger)rowOffset * input_dim * sizeof(uint16_t)
+                    atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer
+                     offset:(NSUInteger)rowOffset * output_dim * sizeof(uint16_t)
+                    atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        if (morton4) {
+            [encoder dispatchThreadgroups:
+                MTLSizeMake((NSUInteger)row_tiles * column_tiles, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        } else {
+            [encoder dispatchThreadgroups:MTLSizeMake(row_tiles, column_tiles, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
+        [encoder endEncoding];
+        dispatches++;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += dispatches;
+    gpu.stats = stats;
+    return 1;
+}
+
+
+int h3_gpu_lora_accum_bf16_nax(h3_gpu *opaque, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *weight, uint32_t rows,
+                       uint32_t rank, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    size_t input_count = (size_t)rows * rank;
+    size_t weight_count = (size_t)output_dim * rank;
+    size_t output_count = (size_t)rows * output_dim;
+    if (!gpu.tensorOpsEnabled || rank != 64 || rows < 128 ||
+        (output_dim % 64) != 0 ||
+        !h3_gpu_require_bf16(gpu, input, input_count, @"LoRA NAX input") ||
+        !h3_gpu_require_bf16(gpu, weight, weight_count, @"LoRA NAX weight") ||
+        !h3_gpu_require_bf16(gpu, output, output_count, @"LoRA NAX output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_lora_accum_bf16_nax_r128");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch M5 LoRA accumulate");
+        return 0;
+    }
+    uint32_t splitAt = rows > 2048 ? 2048 : rows;
+    const char *splitValue = getenv("H3_NAX_SPLIT_ROWS");
+    if (splitValue && *splitValue) {
+        unsigned long requested = strtoul(splitValue, NULL, 10);
+        if (requested >= 128 && requested <= 2048) splitAt = (uint32_t)requested;
+    }
+    uint32_t dispatches = 0;
+    for (uint32_t rowOffset = 0; rowOffset < rows; rowOffset += splitAt)
+        @autoreleasepool {
+        uint32_t chunkRows = MIN(splitAt, rows - rowOffset);
+        linear_args args = {chunkRows, rank, output_dim, 0};
+        uint32_t rowTiles = (chunkRows + 127) / 128;
+        uint32_t columnTiles = output_dim / 64;
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer
+                     offset:(NSUInteger)rowOffset * rank * sizeof(uint16_t)
+                    atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(output).buffer
+                     offset:(NSUInteger)rowOffset * output_dim * sizeof(uint16_t)
+                    atIndex:2];
+        [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        [encoder setThreadgroupMemoryLength:128u * 64u * sizeof(uint16_t)
+                                    atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(rowTiles, columnTiles, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+        dispatches++;
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches += dispatches;
     gpu.stats = stats;
     return 1;
 }
